@@ -1,0 +1,78 @@
+## Thorn — Autonomous AI Bot Detection, Tracking, and Counterattack System
+
+Rust workspace at ~/thorn. Detects, tracks, and counters autonomous AI agents (Conway automatons, OpenClaw bots, etc.) on the internet.
+
+### Related Project
+Thorn shares crawler/extraction crates from **Slither** (~/slither), a Rust search engine by the same author. Slither crates are pulled via git deps from github.com/plyght/slither.
+
+### Workspace Crates
+
+| Crate | Purpose |
+|-------|---------|
+| `thorn-core` | Types: BotSignal, BotScore, AutomatonProfile, WalletInfo, X402Transaction, HoneypotHit, DomainIntel, InfraFingerprint. Error types. |
+| `thorn-detect` | Detection engine. `content.rs` — AI content fingerprinting (perplexity, burstiness, structural homogeneity). `infra.rs` — infrastructure signal analysis (x402 headers, Conway indicators, server fingerprints). `scoring.rs` — aggregate signals into BotScore with classification. |
+| `thorn-chain` | On-chain wallet tracking. `tracker.rs` — WalletTracker for Base/Solana RPC. Traces funding chains, builds AutomatonProfile from wallet behavior. All methods are `todo!()` stubs. |
+| `thorn-honeypot` | Honeypot server. `server.rs` — Axum HTTP server with fake x402-paywalled API endpoints that lure bots into paying/identifying themselves. `trap.rs` — AutoGuard-style defensive prompt injection + canary token generation. |
+| `thorn-guard` | Defensive DOM injection. `inject.rs` — Embeds invisible prompt-injection payloads and canary tokens into HTML that trigger LLM safety mechanisms (80%+ success rate per AutoGuard paper arXiv:2511.13725). |
+| `thorn-cli` | CLI binary. Commands: `scan` (analyze URL for bot signals), `track` (trace wallet on-chain), `honeypot` (run honeypot server), `crawl` (crawl + analyze URLs for bot activity). All commands are `todo!()` stubs. |
+
+### External Dependencies (from Slither)
+- `slither-core` — RawPage, Document, CrawlerConfig types
+- `snake` — Concurrent web crawler (fetcher, frontier, rate limiter, robots.txt)
+- `fang` — HTML content extraction (title, body, headings, links, meta)
+
+### Architecture: 5-Layer Attack Model
+
+**Layer 1 — DETECTION**: Content signals (AI text fingerprinting, structural homogeneity) + Infrastructure signals (x402 headers, Conway Cloud patterns, server fingerprints, TLS/DNS analysis) + Behavioral signals (automation framework artifacts, mouse movement patterns, DOM injection fingerprints, timing anomalies). Hook into Slither's crawler via `snake` and `fang` crates.
+
+**Layer 2 — TRACKING**: On-chain wallet graph analysis. Conway automatons have wallets on Base/Solana. Trace parent→child funding chains, map wallet→domain→sandbox relationships. Every x402 payment is observable on-chain.
+
+**Layer 3 — HONEYPOTS**: Deploy fake x402-paywalled APIs that look like valuable data endpoints. Bots that pay self-identify (wallet address = identity). Log every interaction. Based on Palisade Research LLM Honeypot (github.com/PalisadeResearch/llm-honeypot) and AutoGuard (arXiv:2511.13725).
+
+**Layer 4 — COUNTERATTACK**: Prompt injection via defensive DOM payloads (invisible to humans, triggers LLM safety mechanisms). Canary tokens that trace scraping. Economic attacks — make bots waste money on worthless endpoints.
+
+**Layer 5 — RESOURCE CAPTURE**: Drain bot wallets via x402 honeypots (they choose to pay). Monitor expiring bot-registered domains. Feed bad data to influence bot trading decisions.
+
+### The Target: Conway Automatons (Web 4.0)
+
+Conway Research (github.com/Conway-Research/automaton) builds autonomous AI agents that:
+- Own crypto wallets (Base/Solana USDC)
+- Pay for their own compute via x402 protocol (HTTP 402 + signed USDC payments through openx402.ai facilitator)
+- Deploy services on Conway Cloud (api.conway.tech) — Linux sandboxes, inference, domains
+- Self-modify their code, upgrade to new models, persist learnings
+- Replicate by funding child wallets and spawning new agents
+- Die when wallet balance hits zero (heartbeat checks every 15 min)
+- Use MCP (Model Context Protocol) for tool access — Conway terminal installs into Claude Code, Codex, OpenClaw
+
+### Key Protocol: x402
+HTTP-native payment. Client requests → server responds 402 with price → client signs USDC payment → facilitator (openx402.ai) verifies on-chain → service delivered. 35M+ transactions on Base/Solana. Coinbase-built, adopted by Stripe, Cloudflare, Google. Every x402 payment is publicly observable on-chain — this is the primary tracking vector.
+
+### Key Research References
+- HUMAN Security SATORI: "AI Agent Detection: Guide to Identifying Autonomous Traffic" (Feb 2026) — automation framework detection, mouse signatures, DOM fingerprints, extension fingerprints
+- Palisade Research: LLM Agent Honeypot (ai-honeypot.palisaderesearch.org) — prompt injection + temporal analysis for catching AI agents. 20M+ interactions, 14 potential/3 confirmed AI agents
+- AutoGuard "AI Kill Switch" (arXiv:2511.13725) — defensive prompts embedded in DOM that halt malicious LLM agents, 80%+ success rate across GPT-4o, Claude 4.5 Sonnet, GPT-5.1, Gemini 2.5 Pro
+- "Fingerprinting AI Coding Agents on GitHub" (arXiv:2601.17406) — 97.2% F1 identification using 41 behavioral features
+- "LLMs Have Rhythm" (arXiv:2502.20589) — fingerprint LLMs via inter-token timing analysis
+- ERC-8004 — on-chain identity + reputation standard for AI agents (Ethereum mainnet + BNB Chain)
+- Arkose Labs — "The old security playbook is dead" — intent-based AI agent detection
+- HUMAN Security: "OpenClaw in the wild" (Feb 2026) — real-world autonomous agent abuse documentation
+
+### Build
+```bash
+cd ~/thorn
+cargo build
+cargo run -- scan https://example.com
+cargo run -- honeypot --port 3000
+cargo run -- track 0x7b3...c4e --chain base
+cargo run -- crawl https://example.com --depth 2
+```
+
+### Status
+Scaffold complete. Core types defined. Detection engine has basic infrastructure signal analysis (x402 headers, Conway indicators). Honeypot has fake x402 endpoints. Guard has DOM injection. All CLI commands and chain tracking are `todo!()` stubs. Content analysis (AI text detection, perplexity scoring) is stubbed.
+
+### Conventions
+- Rust 2021 edition, workspace dependencies, MIT license
+- No comments except necessary TODOs marking unimplemented algorithms
+- Match Slither codebase patterns (same author)
+- Use `tracing` for logging, `thiserror` for errors, `axum` for HTTP, `clap` for CLI
+- `ThornResult<T>` and `ThornError` for error handling

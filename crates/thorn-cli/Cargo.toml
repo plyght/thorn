@@ -1,0 +1,26 @@
+[package]
+name = "thorn-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thorn"
+path = "src/main.rs"
+
+[dependencies]
+thorn-core = { workspace = true }
+thorn-detect = { workspace = true }
+thorn-chain = { workspace = true }
+thorn-honeypot = { workspace = true }
+thorn-guard = { workspace = true }
+slither-core = { workspace = true }
+snake = { workspace = true }
+fang = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+axum = { workspace = true }

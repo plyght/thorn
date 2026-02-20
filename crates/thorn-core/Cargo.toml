@@ -1,0 +1,14 @@
+[package]
+name = "thorn-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+slither-core = { workspace = true }

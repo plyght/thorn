@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/thorn-core",
+    "crates/thorn-detect",
+    "crates/thorn-chain",
+    "crates/thorn-honeypot",
+    "crates/thorn-guard",
+    "crates/thorn-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+thorn-core = { path = "crates/thorn-core" }
+thorn-detect = { path = "crates/thorn-detect" }
+thorn-chain = { path = "crates/thorn-chain" }
+thorn-honeypot = { path = "crates/thorn-honeypot" }
+thorn-guard = { path = "crates/thorn-guard" }
+
+slither-core = { git = "https://github.com/plyght/slither", branch = "master" }
+snake = { git = "https://github.com/plyght/slither", branch = "master" }
+fang = { git = "https://github.com/plyght/slither", branch = "master" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["gzip", "brotli", "deflate", "rustls-tls", "json"], default-features = false }
+url = { version = "2", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+dashmap = "6"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

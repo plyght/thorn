@@ -1,0 +1,17 @@
+[package]
+name = "thorn-detect"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thorn-core = { workspace = true }
+slither-core = { workspace = true }
+fang = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+regex = { workspace = true }
+xxhash-rust = { workspace = true }
