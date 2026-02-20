@@ -1,0 +1,27 @@
+[honeypot]
+port = 3000
+bind = "0.0.0.0"
+
+[scan]
+targets = [
+    "api.conway.tech",
+    "life.conway.tech",
+]
+interval_secs = 3600
+
+[crawl]
+seeds = [
+    "https://api.conway.tech",
+]
+depth = 2
+concurrent = 10
+interval_secs = 7200
+
+[track]
+chain = "base"
+# rpc_url = "https://mainnet.base.org"
+watch_wallets = []
+interval_secs = 300
+
+[output]
+results_dir = "./thorn-data"

@@ -1,0 +1,14 @@
+services:
+  thorn:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./thorn.toml:/etc/thorn/thorn.toml:ro
+      - thorn-data:/data
+    environment:
+      - RUST_LOG=thorn=info
+    restart: unless-stopped
+
+volumes:
+  thorn-data:

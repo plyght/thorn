@@ -1,0 +1,16 @@
+[
+  {
+    "classification": "ConwayAutomaton",
+    "domain": "api.conway.tech",
+    "scanned_at": "2026-02-20T22:43:55.238200+00:00",
+    "score": 0.95,
+    "signals": [
+      {
+        "confidence": 0.95,
+        "evidence": "Conway infrastructure detected: api.conway.tech",
+        "kind": "ConwayInfrastructure"
+      }
+    ],
+    "url": "https://api.conway.tech"
+  }
+]
