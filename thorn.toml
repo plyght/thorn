@@ -24,4 +24,31 @@ watch_wallets = []
 interval_secs = 300
 
 [output]
-results_dir = "./thorn-data"
+results_dir = "/data"
+
+[db]
+path = "/data/thorn.db"
+
+[api]
+port = 3001
+bind = "127.0.0.1"
+
+# [notify]
+# webhook_urls = ["https://hooks.slack.com/services/XXX/YYY/ZZZ"]
+# ntfy_topic = "thorn-alerts"
+# ntfy_server = "https://ntfy.sh"
+
+# [r2]
+# bucket = "thorn-archive"
+# account_id = ""
+# access_key_id = ""
+# secret_access_key = ""
+# archive_interval_secs = 3600
+
+# [capture]
+# enabled = false
+# poison_ratio = 0.3
+# drain_base_price = 0.05
+# drain_multiplier = 1.5
+# drain_max_price = 10.0
+# monitor_domains = []

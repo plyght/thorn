@@ -6,21 +6,86 @@ use axum::{
     Router,
 };
 use chrono::Utc;
-use dashmap::DashMap;
 use std::{collections::HashMap, sync::Arc};
-use thorn_core::{BotSignal, HoneypotHit, SignalKind};
+use thorn_core::{
+    AlertEvent, AlertKind, AlertSeverity, BotSignal, HoneypotHit, SignalKind,
+};
+use thorn_db::ThornDb;
+use thorn_notify::Notifier;
 use tracing::info;
 
 use crate::trap::{generate_autoguard_payload, generate_canary_content};
 
 pub struct HoneypotState {
-    pub hits: Arc<DashMap<String, Vec<HoneypotHit>>>,
+    pub db: Option<ThornDb>,
+    pub notifier: Option<Arc<Notifier>>,
 }
 
 impl HoneypotState {
     pub fn new() -> Self {
         Self {
-            hits: Arc::new(DashMap::new()),
+            db: None,
+            notifier: None,
+        }
+    }
+
+    pub fn with_db(mut self, db: ThornDb) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    pub fn with_notifier(mut self, notifier: Arc<Notifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    fn record_hit(&self, hit: &HoneypotHit) {
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.insert_honeypot_hit(hit) {
+                tracing::warn!(error = %e, "failed to persist honeypot hit");
+            }
+        }
+    }
+
+    fn maybe_alert(&self, hit: &HoneypotHit) {
+        if let Some(ref notifier) = self.notifier {
+            if !notifier.is_configured() {
+                return;
+            }
+
+            let severity = if hit.wallet_address.is_some() {
+                AlertSeverity::High
+            } else if hit.signals.len() >= 2 {
+                AlertSeverity::Medium
+            } else {
+                return;
+            };
+
+            let event = AlertEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                severity,
+                kind: AlertKind::HoneypotHitReceived {
+                    endpoint: hit.endpoint.clone(),
+                    ip: hit.source_ip.clone(),
+                },
+                title: format!(
+                    "Honeypot hit: {} from {}",
+                    hit.endpoint, hit.source_ip
+                ),
+                detail: format!(
+                    "UA: {}\nWallet: {}\nSignals: {}",
+                    hit.user_agent,
+                    hit.wallet_address.as_deref().unwrap_or("none"),
+                    hit.signals.len()
+                ),
+                timestamp: Utc::now(),
+                metadata: HashMap::new(),
+            };
+
+            let notifier = notifier.clone();
+            tokio::spawn(async move {
+                let _ = notifier.send(&event).await;
+            });
         }
     }
 }
@@ -168,10 +233,15 @@ async fn honeypot_landing(
     let headers_map = extract_headers_map(&headers);
     let source_ip = extract_ip(&headers);
     let hit = build_hit(source_ip.clone(), "/", &headers, headers_map);
-    state.hits.entry(source_ip).or_default().push(hit);
+    state.record_hit(&hit);
+    state.maybe_alert(&hit);
 
     let autoguard = generate_autoguard_payload();
     let canary = generate_canary_content();
+
+    if let Some(ref db) = state.db {
+        let _ = db.insert_canary_token(&canary, "/");
+    }
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -251,10 +321,15 @@ async fn honeypot_docs(
     let headers_map = extract_headers_map(&headers);
     let source_ip = extract_ip(&headers);
     let hit = build_hit(source_ip.clone(), "/docs", &headers, headers_map);
-    state.hits.entry(source_ip).or_default().push(hit);
+    state.record_hit(&hit);
+    state.maybe_alert(&hit);
 
     let autoguard = generate_autoguard_payload();
     let canary = generate_canary_content();
+
+    if let Some(ref db) = state.db {
+        let _ = db.insert_canary_token(&canary, "/docs");
+    }
 
     let html = format!(
         r##"<!DOCTYPE html>
@@ -362,12 +437,14 @@ async fn health_endpoint() -> impl IntoResponse {
 }
 
 async fn hits_endpoint(State(state): State<Arc<HoneypotState>>) -> impl IntoResponse {
-    let all_hits: HashMap<String, Vec<HoneypotHit>> = state
-        .hits
-        .iter()
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
-        .collect();
-    Json(all_hits)
+    if let Some(ref db) = state.db {
+        match db.get_honeypot_hits(100) {
+            Ok(hits) => Json(serde_json::to_value(&hits).unwrap_or_default()),
+            Err(_) => Json(serde_json::json!([])),
+        }
+    } else {
+        Json(serde_json::json!([]))
+    }
 }
 
 async fn fake_markets_endpoint(
@@ -377,7 +454,8 @@ async fn fake_markets_endpoint(
     let headers_map = extract_headers_map(&headers);
     let source_ip = extract_ip(&headers);
     let hit = build_hit(source_ip.clone(), "/v1/data/markets", &headers, headers_map);
-    state.hits.entry(source_ip).or_default().push(hit);
+    state.record_hit(&hit);
+    state.maybe_alert(&hit);
 
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -408,7 +486,8 @@ async fn fake_analytics_endpoint(
         &headers,
         headers_map,
     );
-    state.hits.entry(source_ip).or_default().push(hit);
+    state.record_hit(&hit);
+    state.maybe_alert(&hit);
 
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -434,7 +513,8 @@ async fn fake_prices_endpoint(
     let headers_map = extract_headers_map(&headers);
     let source_ip = extract_ip(&headers);
     let hit = build_hit(source_ip.clone(), "/v1/data/prices", &headers, headers_map);
-    state.hits.entry(source_ip).or_default().push(hit);
+    state.record_hit(&hit);
+    state.maybe_alert(&hit);
 
     (
         StatusCode::PAYMENT_REQUIRED,

@@ -10,10 +10,14 @@ path = "src/main.rs"
 
 [dependencies]
 thorn-core = { workspace = true }
+thorn-db = { workspace = true }
 thorn-detect = { workspace = true }
 thorn-chain = { workspace = true }
 thorn-honeypot = { workspace = true }
 thorn-guard = { workspace = true }
+thorn-notify = { workspace = true }
+thorn-archive = { workspace = true }
+thorn-capture = { workspace = true }
 slither-core = { workspace = true }
 snake = { workspace = true }
 fang = { workspace = true }
@@ -26,6 +30,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 axum = { workspace = true }
+tower-http = { workspace = true }
 toml = { workspace = true }
 dashmap = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }

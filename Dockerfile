@@ -14,9 +14,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/thorn /usr/local/bin/thorn
-COPY thorn.toml /etc/thorn/thorn.toml
 
 ENV RUST_LOG=thorn=info
 
 ENTRYPOINT ["thorn"]
-CMD ["daemon", "-f", "/etc/thorn/thorn.toml"]

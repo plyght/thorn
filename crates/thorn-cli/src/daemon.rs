@@ -1,65 +1,17 @@
 use crate::config::ThornConfig;
 use chrono::Utc;
-use dashmap::{DashMap, DashSet};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use thorn_archive::R2Archive;
 use thorn_chain::tracker::WalletTracker;
-use thorn_core::{BotScore, Chain};
+use thorn_core::{AlertEvent, AlertKind, AlertSeverity, Chain, ScanRecord};
+use thorn_db::ThornDb;
 use thorn_detect::{content, infra, scoring};
 use thorn_honeypot::server::{honeypot_router, HoneypotState};
+use thorn_notify::Notifier;
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
-
-#[derive(Serialize)]
-struct ScanResult {
-    url: String,
-    domain: String,
-    score: f64,
-    classification: String,
-    signals: Vec<SignalEntry>,
-    scanned_at: String,
-}
-
-#[derive(Serialize)]
-struct SignalEntry {
-    kind: String,
-    confidence: f64,
-    evidence: String,
-}
-
-#[derive(Serialize)]
-struct WalletResult {
-    wallet: String,
-    chain: String,
-    status: String,
-    total_spent: f64,
-    total_earned: f64,
-    parent_wallet: Option<String>,
-    signals: Vec<SignalEntry>,
-    tracked_at: String,
-}
-
-struct DaemonState {
-    honeypot: Arc<HoneypotState>,
-    known_wallets: Arc<DashSet<String>>,
-    results_dir: PathBuf,
-    scan_results: Arc<DashMap<String, ScanResult>>,
-    wallet_results: Arc<DashMap<String, WalletResult>>,
-}
-
-fn score_to_signals(score: &BotScore) -> Vec<SignalEntry> {
-    score
-        .signals
-        .iter()
-        .map(|s| SignalEntry {
-            kind: format!("{:?}", s.kind),
-            confidence: s.confidence,
-            evidence: s.evidence.clone(),
-        })
-        .collect()
-}
 
 fn parse_chain(s: &str) -> Chain {
     match s.to_lowercase().as_str() {
@@ -83,23 +35,61 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
     let results_dir = PathBuf::from(&config.output.results_dir);
     std::fs::create_dir_all(&results_dir)?;
 
-    let state = Arc::new(DaemonState {
-        honeypot: Arc::new(HoneypotState::new()),
-        known_wallets: Arc::new(DashSet::new()),
-        results_dir: results_dir.clone(),
-        scan_results: Arc::new(DashMap::new()),
-        wallet_results: Arc::new(DashMap::new()),
+    let db_path = config
+        .db
+        .as_ref()
+        .map(|d| d.path.clone())
+        .unwrap_or_else(|| format!("{}/thorn.db", results_dir.display()));
+
+    if let Some(parent) = std::path::Path::new(&db_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let db = ThornDb::open(&db_path)?;
+    info!(path = %db_path, "database opened");
+
+    let notifier = Arc::new(match &config.notify {
+        Some(nc) => Notifier::new(
+            nc.webhook_urls.clone(),
+            nc.ntfy_topic.clone(),
+            nc.ntfy_server.clone(),
+        ),
+        None => Notifier::noop(),
     });
+
+    if notifier.is_configured() {
+        info!("notifications configured");
+    }
+
+    let archive: Option<Arc<R2Archive>> = match &config.r2 {
+        Some(r2c) => match R2Archive::new(&r2c.bucket, &r2c.account_id, &r2c.access_key_id, &r2c.secret_access_key) {
+            Ok(a) => {
+                info!(bucket = %r2c.bucket, "R2 archive connected");
+                Some(Arc::new(a))
+            }
+            Err(e) => {
+                warn!(error = %e, "R2 archive init failed, continuing without archival");
+                None
+            }
+        },
+        None => None,
+    };
 
     if let Some(track) = &config.track {
         for w in &track.watch_wallets {
-            state.known_wallets.insert(w.clone());
+            let chain_str = &track.chain;
+            db.upsert_wallet(w, chain_str, 0.0, 0, "Unknown", None, 0.0, 0.0)?;
+            info!(wallet = %w, "initial watch wallet registered");
         }
     }
 
     info!("starting thorn daemon");
 
-    let honeypot_state = state.honeypot.clone();
+    let honeypot_state = Arc::new(
+        HoneypotState::new()
+            .with_db(db.clone_handle())
+            .with_notifier(notifier.clone()),
+    );
     let honeypot_port = config.honeypot.port;
     let honeypot_bind = config.honeypot.bind.clone();
     let honeypot_handle = tokio::spawn(async move {
@@ -116,27 +106,59 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
         }
     });
 
-    let wallet_state = state.clone();
-    let wallet_handle = tokio::spawn(async move {
+    let discovery_db = db.clone_handle();
+    let discovery_notifier = notifier.clone();
+    let discovery_handle = tokio::spawn(async move {
         let mut tick = interval(Duration::from_secs(30));
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; ThornBot/0.1)")
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build http client");
         loop {
             tick.tick().await;
-            let honeypot_hits = wallet_state.honeypot.hits.clone();
-            for entry in honeypot_hits.iter() {
-                for hit in entry.value() {
-                    if let Some(ref wallet) = hit.wallet_address {
-                        if !wallet.is_empty() && !wallet_state.known_wallets.contains(wallet) {
-                            info!("new wallet discovered from honeypot: {}", wallet);
-                            wallet_state.known_wallets.insert(wallet.clone());
-                        }
-                    }
+
+            let wallets = match discovery_db.get_wallets_discovered_from_honeypot() {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+
+            for wallet in &wallets {
+                let existing = discovery_db.get_wallet_addresses().unwrap_or_default();
+                if !existing.contains(wallet) {
+                    info!(wallet = %wallet, "new wallet discovered from honeypot");
+                    let _ = discovery_db.upsert_wallet(wallet, "base", 0.0, 0, "Unknown", None, 0.0, 0.0);
+
+                    let event = AlertEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        severity: AlertSeverity::High,
+                        kind: AlertKind::WalletDiscovered {
+                            address: wallet.clone(),
+                            chain: Chain::Base,
+                        },
+                        title: format!("New wallet discovered: {}", &wallet[..wallet.len().min(10)]),
+                        detail: format!("Wallet {} found via honeypot interaction", wallet),
+                        timestamp: Utc::now(),
+                        metadata: HashMap::new(),
+                    };
+                    let _ = discovery_notifier.send(&event).await;
                 }
+            }
+
+            let targets = discovery_db.get_unscanned_targets(5).unwrap_or_default();
+            for (target_url, _priority) in &targets {
+                info!(url = %target_url, "scanning discovered target");
+                if let Err(e) = scan_and_store(&client, target_url, &discovery_db).await {
+                    warn!(url = %target_url, error = %e, "discovered target scan failed");
+                }
+                let _ = discovery_db.mark_target_scanned(target_url);
             }
         }
     });
 
     let scan_handle = if let Some(scan_config) = config.scan {
-        let scan_state = state.clone();
+        let scan_db = db.clone_handle();
+        let scan_notifier = notifier.clone();
         let targets = scan_config.targets;
         let interval_secs = scan_config.interval_secs;
         Some(tokio::spawn(async move {
@@ -150,13 +172,26 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
                 tick.tick().await;
                 info!("running scheduled scan of {} target(s)", targets.len());
                 for target in &targets {
-                    if let Err(e) =
-                        scan_target(&client, target, &scan_state).await
-                    {
-                        warn!("scan failed for {}: {}", target, e);
+                    match scan_and_store(&client, target, &scan_db).await {
+                        Ok(Some(score)) if score > 0.6 => {
+                            let event = AlertEvent {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                severity: AlertSeverity::High,
+                                kind: AlertKind::BotDetected {
+                                    url: target.clone(),
+                                    score,
+                                },
+                                title: format!("Bot detected: {}", target),
+                                detail: format!("Score: {:.2}", score),
+                                timestamp: Utc::now(),
+                                metadata: HashMap::new(),
+                            };
+                            let _ = scan_notifier.send(&event).await;
+                        }
+                        Err(e) => warn!("scan failed for {}: {}", target, e),
+                        _ => {}
                     }
                 }
-                persist_results(&scan_state).await;
             }
         }))
     } else {
@@ -164,7 +199,7 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
     };
 
     let crawl_handle = if let Some(crawl_config) = config.crawl {
-        let crawl_state = state.clone();
+        let crawl_db = db.clone_handle();
         let seeds = crawl_config.seeds;
         let depth = crawl_config.depth;
         let concurrent = crawl_config.concurrent;
@@ -174,12 +209,9 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
             loop {
                 tick.tick().await;
                 info!("running scheduled crawl of {} seed(s)", seeds.len());
-                if let Err(e) =
-                    crawl_targets(&seeds, depth, concurrent, &crawl_state).await
-                {
+                if let Err(e) = crawl_and_store(&seeds, depth, concurrent, &crawl_db).await {
                     warn!("crawl failed: {}", e);
                 }
-                persist_results(&crawl_state).await;
             }
         }))
     } else {
@@ -187,7 +219,8 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
     };
 
     let track_handle = if config.track.is_some() {
-        let track_state = state.clone();
+        let track_db = db.clone_handle();
+        let track_notifier = notifier.clone();
         let track_config = config.track.unwrap();
         let chain = parse_chain(&track_config.chain);
         let rpc_url = track_config
@@ -199,35 +232,70 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
             let tracker = WalletTracker::new(rpc_url, chain);
             loop {
                 tick.tick().await;
-                let wallets: Vec<String> =
-                    track_state.known_wallets.iter().map(|w| w.clone()).collect();
+                let wallets = track_db.get_wallet_addresses().unwrap_or_default();
                 if wallets.is_empty() {
                     continue;
                 }
                 info!("tracking {} wallet(s)", wallets.len());
                 for wallet in &wallets {
-                    if let Err(e) =
-                        track_wallet(&tracker, wallet, &track_state).await
-                    {
+                    if let Err(e) = track_and_store(&tracker, wallet, &track_db, &track_notifier).await {
                         warn!("track failed for {}: {}", wallet, e);
                     }
                 }
-                persist_results(&track_state).await;
             }
         }))
     } else {
         None
     };
 
-    info!("daemon running — honeypot + schedulers active");
+    let archive_handle = if let Some(arc) = archive {
+        let archive_db = db.clone_handle();
+        let archive_interval = config
+            .r2
+            .as_ref()
+            .map(|r| r.archive_interval_secs)
+            .unwrap_or(3600);
+        Some(tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(archive_interval));
+            loop {
+                tick.tick().await;
+                info!("running periodic R2 archival");
+
+                if let Ok(hits) = archive_db.get_honeypot_hits(1000) {
+                    if !hits.is_empty() {
+                        let json = serde_json::to_value(&hits).unwrap_or_default();
+                        if let Err(e) = arc.archive_honeypot_hits(&json).await {
+                            warn!(error = %e, "R2 honeypot archive failed");
+                        }
+                    }
+                }
+
+                if let Ok(scans) = archive_db.get_scan_results(1000) {
+                    if !scans.is_empty() {
+                        let json = serde_json::to_value(&scans).unwrap_or_default();
+                        if let Err(e) = arc.archive_scan_results(&json).await {
+                            warn!(error = %e, "R2 scan archive failed");
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    let stats = db.stats()?;
     info!(
-        "results persisted to {}",
-        results_dir.display()
+        scans = stats.scan_results,
+        hits = stats.honeypot_hits,
+        wallets = stats.wallets,
+        targets = stats.discovered_targets,
+        "daemon running — honeypot + schedulers + discovery loop active"
     );
 
     tokio::select! {
         _ = honeypot_handle => error!("honeypot task exited"),
-        _ = wallet_handle => error!("wallet watcher task exited"),
+        _ = discovery_handle => error!("discovery task exited"),
         _ = async { if let Some(h) = scan_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
             error!("scan task exited")
         }
@@ -237,21 +305,23 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
         _ = async { if let Some(h) = track_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
             error!("track task exited")
         }
+        _ = async { if let Some(h) = archive_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
+            error!("archive task exited")
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down");
         }
     }
 
-    persist_results(&state).await;
     info!("daemon stopped");
     Ok(())
 }
 
-async fn scan_target(
+async fn scan_and_store(
     client: &reqwest::Client,
     target: &str,
-    state: &Arc<DaemonState>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    db: &ThornDb,
+) -> Result<Option<f64>, Box<dyn std::error::Error + Send + Sync>> {
     let url = if target.starts_with("http://") || target.starts_with("https://") {
         target.to_string()
     } else {
@@ -290,7 +360,7 @@ async fn scan_target(
         Err(_) => (String::new(), html, Vec::new()),
     };
 
-    let (infra_signals, _fingerprint) = infra::analyze_infrastructure(&headers_map, &domain);
+    let (infra_signals, fingerprint) = infra::analyze_infrastructure(&headers_map, &domain);
     let content_signals = content::analyze_content(&body, &title, &headings);
 
     let mut all_signals = infra_signals;
@@ -307,28 +377,40 @@ async fn scan_target(
     let score = scoring::compute_bot_score(all_signals);
 
     info!(
-        "scan {} — score={:.2} classification={:?}",
-        url, score.score, score.classification
+        url = %url,
+        score = score.score,
+        classification = ?score.classification,
+        "scan complete"
     );
 
-    let result = ScanResult {
+    let record = ScanRecord {
+        id: uuid::Uuid::new_v4().to_string(),
         url: url.clone(),
-        domain,
+        domain: domain.clone(),
         score: score.score,
         classification: format!("{:?}", score.classification),
-        signals: score_to_signals(&score),
-        scanned_at: Utc::now().to_rfc3339(),
+        signals: score.signals.clone(),
+        scanned_at: Utc::now(),
     };
+    db.insert_scan_result(&record)?;
 
-    state.scan_results.insert(url, result);
-    Ok(())
+    let infra_json = serde_json::to_string(&fingerprint).unwrap_or_else(|_| "{}".to_string());
+    db.upsert_domain(
+        &domain,
+        None,
+        Some(score.score),
+        Some(&format!("{:?}", score.classification)),
+        &infra_json,
+    )?;
+
+    Ok(Some(score.score))
 }
 
-async fn crawl_targets(
+async fn crawl_and_store(
     seeds: &[String],
     depth: usize,
     concurrent: usize,
-    state: &Arc<DaemonState>,
+    db: &ThornDb,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = slither_core::CrawlerConfig {
         max_concurrent: concurrent,
@@ -366,7 +448,7 @@ async fn crawl_targets(
             Err(_) => continue,
         };
 
-        let (infra_signals, _) = infra::analyze_infrastructure(&page_headers, &domain);
+        let (infra_signals, fingerprint) = infra::analyze_infrastructure(&page_headers, &domain);
         let content_signals = content::analyze_content(&body, &title, &headings);
 
         let mut all_signals = infra_signals;
@@ -384,31 +466,45 @@ async fn crawl_targets(
 
         if score.score > 0.4 {
             info!(
-                "crawl detected bot signal: {} score={:.2} {:?}",
-                url, score.score, score.classification
+                url = %url,
+                score = score.score,
+                classification = ?score.classification,
+                "crawl detected bot signal"
             );
+
+            let _ = db.insert_discovered_target(&url, "CrawlLink", &domain, score.score);
         }
 
-        let result = ScanResult {
-            url: url.clone(),
-            domain,
+        let record = ScanRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            url,
+            domain: domain.clone(),
             score: score.score,
             classification: format!("{:?}", score.classification),
-            signals: score_to_signals(&score),
-            scanned_at: Utc::now().to_rfc3339(),
+            signals: score.signals.clone(),
+            scanned_at: Utc::now(),
         };
+        let _ = db.insert_scan_result(&record);
 
-        state.scan_results.insert(url, result);
+        let infra_json = serde_json::to_string(&fingerprint).unwrap_or_else(|_| "{}".to_string());
+        let _ = db.upsert_domain(
+            &domain,
+            None,
+            Some(score.score),
+            Some(&format!("{:?}", score.classification)),
+            &infra_json,
+        );
     }
 
     crawl_handle.await.ok();
     Ok(())
 }
 
-async fn track_wallet(
+async fn track_and_store(
     tracker: &WalletTracker,
     wallet: &str,
-    state: &Arc<DaemonState>,
+    db: &ThornDb,
+    _notifier: &Notifier,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let profile = tracker.build_automaton_profile(wallet).await.map_err(|e| {
         Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
@@ -416,92 +512,42 @@ async fn track_wallet(
     })?;
 
     info!(
-        "tracked {} — status={:?} spent={:.6}",
-        wallet, profile.status, profile.total_spent
+        wallet = %wallet,
+        status = ?profile.status,
+        spent = profile.total_spent,
+        "tracked wallet"
     );
 
-    let signals: Vec<SignalEntry> = profile
-        .signals
-        .iter()
-        .map(|s| SignalEntry {
-            kind: format!("{:?}", s.kind),
-            confidence: s.confidence,
-            evidence: s.evidence.clone(),
-        })
-        .collect();
+    db.upsert_wallet(
+        wallet,
+        &format!("{:?}", profile.chain),
+        profile.total_spent,
+        0,
+        &format!("{:?}", profile.status),
+        profile.parent_wallet.as_deref(),
+        profile.total_spent,
+        profile.total_earned,
+    )
+    .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
 
-    let result = WalletResult {
-        wallet: wallet.to_string(),
-        chain: format!("{:?}", profile.chain),
-        status: format!("{:?}", profile.status),
-        total_spent: profile.total_spent,
-        total_earned: profile.total_earned,
-        parent_wallet: profile.parent_wallet,
-        signals,
-        tracked_at: Utc::now().to_rfc3339(),
-    };
+    if let Some(ref parent) = profile.parent_wallet {
+        let _ = db.insert_wallet_child(parent, wallet);
 
-    state.wallet_results.insert(wallet.to_string(), result);
+        let existing = db.get_wallet_addresses().unwrap_or_default();
+        if !existing.contains(parent) {
+            let _ = db.upsert_wallet(parent, &format!("{:?}", profile.chain), 0.0, 0, "Unknown", None, 0.0, 0.0);
+            info!(parent = %parent, child = %wallet, "discovered parent wallet");
+        }
+    }
+
+    for child in &profile.children_wallets {
+        let _ = db.insert_wallet_child(wallet, child);
+    }
+
+    let x402_txs = tracker.get_x402_transactions(wallet).await.unwrap_or_default();
+    for tx in &x402_txs {
+        let _ = db.insert_x402_transaction(tx);
+    }
+
     Ok(())
-}
-
-async fn persist_results(state: &Arc<DaemonState>) {
-    let scans: Vec<serde_json::Value> = state
-        .scan_results
-        .iter()
-        .filter_map(|r| serde_json::to_value(r.value()).ok())
-        .collect();
-
-    if !scans.is_empty() {
-        let path = state.results_dir.join("scans.json");
-        match serde_json::to_string_pretty(&scans) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    warn!("failed to write scans: {}", e);
-                }
-            }
-            Err(e) => warn!("failed to serialize scans: {}", e),
-        }
-    }
-
-    let wallets: Vec<serde_json::Value> = state
-        .wallet_results
-        .iter()
-        .filter_map(|r| serde_json::to_value(r.value()).ok())
-        .collect();
-
-    if !wallets.is_empty() {
-        let path = state.results_dir.join("wallets.json");
-        match serde_json::to_string_pretty(&wallets) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    warn!("failed to write wallets: {}", e);
-                }
-            }
-            Err(e) => warn!("failed to serialize wallets: {}", e),
-        }
-    }
-
-    let hits_count: usize = state.honeypot.hits.iter().map(|e| e.value().len()).sum();
-    if hits_count > 0 {
-        let path = state.results_dir.join("honeypot_hits.json");
-        let hits: HashMap<String, serde_json::Value> = state
-            .honeypot
-            .hits
-            .iter()
-            .filter_map(|e| {
-                serde_json::to_value(e.value())
-                    .ok()
-                    .map(|v| (e.key().clone(), v))
-            })
-            .collect();
-        match serde_json::to_string_pretty(&hits) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    warn!("failed to write honeypot hits: {}", e);
-                }
-            }
-            Err(e) => warn!("failed to serialize honeypot hits: {}", e),
-        }
-    }
 }

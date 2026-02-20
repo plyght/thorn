@@ -1,6 +1,6 @@
 ## Thorn — Autonomous AI Bot Detection, Tracking, and Counterattack System
 
-Rust workspace at ~/thorn. Detects, tracks, and counters autonomous AI agents (Conway automatons, OpenClaw bots, etc.) on the internet.
+Rust workspace at ~/thorn. Detects, tracks, and counters autonomous AI agents (Conway automatons, OpenClaw bots, etc.) on the internet. Three-process architecture: honeypot (inbound traps), daemon (outbound scanning + discovery loop), API (query interface). SQLite for persistence, Cloudflare R2 for archival, CF Tunnel for honeypot exposure.
 
 ### Related Project
 Thorn shares crawler/extraction crates from **Slither** (~/slither), a Rust search engine by the same author. Slither crates are pulled via git deps from github.com/plyght/slither.
@@ -9,12 +9,16 @@ Thorn shares crawler/extraction crates from **Slither** (~/slither), a Rust sear
 
 | Crate | Purpose |
 |-------|---------|
-| `thorn-core` | Types: BotSignal, BotScore, AutomatonProfile, WalletInfo, X402Transaction, HoneypotHit, DomainIntel, InfraFingerprint. Error types. |
-| `thorn-detect` | Detection engine. `content.rs` — AI content fingerprinting (perplexity, burstiness, structural homogeneity). `infra.rs` — infrastructure signal analysis (x402 headers, Conway indicators, server fingerprints). `scoring.rs` — aggregate signals into BotScore with classification. |
-| `thorn-chain` | On-chain wallet tracking. `tracker.rs` — WalletTracker for Base/Solana RPC. Traces funding chains, builds AutomatonProfile from wallet behavior. All methods are `todo!()` stubs. |
-| `thorn-honeypot` | Honeypot server. `server.rs` — Axum HTTP server with fake x402-paywalled API endpoints that lure bots into paying/identifying themselves. `trap.rs` — AutoGuard-style defensive prompt injection + canary token generation. |
+| `thorn-core` | Types: BotSignal, BotScore, AutomatonProfile, WalletInfo, X402Transaction, HoneypotHit, DomainIntel, InfraFingerprint, AlertEvent, AlertSeverity, AlertKind, DiscoveredTarget, DiscoverySource, CaptureStrategy, CaptureKind, ScanRecord. Error types via thiserror. |
+| `thorn-detect` | Detection engine. `content.rs` — AI content fingerprinting (perplexity, burstiness, structural homogeneity). `infra.rs` — infrastructure signal analysis (x402 headers, Conway indicators, server fingerprints). `scoring.rs` — aggregate signals into BotScore with classification. `behavioral.rs` — timing anomaly detection, automation framework artifacts, request pattern fingerprinting. |
+| `thorn-chain` | On-chain wallet tracking. `tracker.rs` — WalletTracker for Base/Solana/Ethereum RPC. Traces funding chains, builds AutomatonProfile from wallet behavior. |
+| `thorn-honeypot` | Honeypot server. `server.rs` — Axum HTTP server with fake x402-paywalled API endpoints. Persists hits to SQLite via ThornDb, dispatches alerts via Notifier. `trap.rs` — AutoGuard-style defensive prompt injection + canary token generation. |
 | `thorn-guard` | Defensive DOM injection. `inject.rs` — Embeds invisible prompt-injection payloads and canary tokens into HTML that trigger LLM safety mechanisms (80%+ success rate per AutoGuard paper arXiv:2511.13725). |
-| `thorn-cli` | CLI binary. Commands: `scan` (analyze URL for bot signals), `track` (trace wallet on-chain), `honeypot` (run honeypot server), `crawl` (crawl + analyze URLs for bot activity). All commands are `todo!()` stubs. |
+| `thorn-db` | SQLite persistence layer. `schema.rs` — 9 tables (scan_results, wallets, wallet_children, honeypot_hits, domains, discovered_targets, canary_tokens, x402_transactions, capture_strategies) + 11 indexes. `ops.rs` — ThornDb struct with CRUD operations, WAL mode, clone_handle() for sharing across tasks. |
+| `thorn-notify` | Alerting system. `webhook.rs` — WebhookNotifier (generic + Slack-formatted payloads). `ntfy.rs` — NtfyNotifier (ntfy.sh mobile push, free, no signup). Unified Notifier facade. |
+| `thorn-archive` | R2 archival via rust-s3. `r2.rs` — R2Archive with upload_json, archive_honeypot_hits, archive_scan_results, archive_evidence. Uses Region::R2 with path-style addressing. |
+| `thorn-capture` | Layer 5 resource capture. `drain.rs` — DrainEngine (escalating x402 prices per wallet). `poison.rs` — PoisonGenerator (fake market/analytics/price data). `domains.rs` — DomainMonitor (RDAP expiry checking for bot-registered domains). |
+| `thorn-cli` | CLI binary. Commands: `scan`, `track`, `honeypot`, `crawl`, `daemon`, `api`. Daemon runs all subsystems (honeypot + scan/crawl/track schedulers + discovery loop + R2 archival). API provides read/write query interface. |
 
 ### External Dependencies (from Slither)
 - `slither-core` — RawPage, Document, CrawlerConfig types
@@ -32,6 +36,14 @@ Thorn shares crawler/extraction crates from **Slither** (~/slither), a Rust sear
 **Layer 4 — COUNTERATTACK**: Prompt injection via defensive DOM payloads (invisible to humans, triggers LLM safety mechanisms). Canary tokens that trace scraping. Economic attacks — make bots waste money on worthless endpoints.
 
 **Layer 5 — RESOURCE CAPTURE**: Drain bot wallets via x402 honeypots (they choose to pay). Monitor expiring bot-registered domains. Feed bad data to influence bot trading decisions.
+
+### Three-Process Deployment Model
+
+1. **Honeypot** (port 3000, public via CF Tunnel) — Inbound trap. Serves fake x402 endpoints, records hits, alerts on wallet-bearing visitors.
+2. **Daemon** (background) — Outbound scanner. Scheduled scan/crawl/track loops, discovery feedback loop (honeypot hit → wallet → trace → discover domains → scan), R2 periodic archival.
+3. **API** (port 3001, internal only) — Query interface. GET /api/stats, /api/scans, /api/wallets, /api/hits, /api/targets. POST /api/wallets to add watch wallets.
+
+All three share SQLite via WAL mode. Deployed as Docker containers on Hetzner CX22 VPS with cloudflared sidecar for CF Tunnel.
 
 ### The Target: Conway Automatons (Web 4.0)
 
@@ -57,18 +69,20 @@ HTTP-native payment. Client requests → server responds 402 with price → clie
 - Arkose Labs — "The old security playbook is dead" — intent-based AI agent detection
 - HUMAN Security: "OpenClaw in the wild" (Feb 2026) — real-world autonomous agent abuse documentation
 
-### Build
+### Build & Run
 ```bash
 cd ~/thorn
-cargo build
+cargo build --release
+
 cargo run -- scan https://example.com
-cargo run -- honeypot --port 3000
+cargo run -- honeypot --port 3000 --db ./thorn-data/thorn.db
 cargo run -- track 0x7b3...c4e --chain base
 cargo run -- crawl https://example.com --depth 2
-```
+cargo run -- daemon -f thorn.toml
+cargo run -- api --port 3001 --db ./thorn-data/thorn.db
 
-### Status
-Scaffold complete. Core types defined. Detection engine has basic infrastructure signal analysis (x402 headers, Conway indicators). Honeypot has fake x402 endpoints. Guard has DOM injection. All CLI commands and chain tracking are `todo!()` stubs. Content analysis (AI text detection, perplexity scoring) is stubbed.
+docker compose up -d
+```
 
 ### Conventions
 - Rust 2021 edition, workspace dependencies, MIT license
@@ -76,3 +90,5 @@ Scaffold complete. Core types defined. Detection engine has basic infrastructure
 - Match Slither codebase patterns (same author)
 - Use `tracing` for logging, `thiserror` for errors, `axum` for HTTP, `clap` for CLI
 - `ThornResult<T>` and `ThornError` for error handling
+- SQLite with WAL mode, shared via `ThornDb::clone_handle()`
+- Three-process model sharing SQLite DB volume

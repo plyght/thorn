@@ -1,3 +1,4 @@
+mod api;
 mod config;
 mod daemon;
 
@@ -6,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thorn_chain::tracker::WalletTracker;
 use thorn_core::Chain;
+use thorn_db::ThornDb;
 use thorn_detect::{content, infra, scoring};
 use thorn_honeypot::server::{honeypot_router, HoneypotState};
 
@@ -34,6 +36,8 @@ enum Commands {
     Honeypot {
         #[arg(short, long, default_value = "3000")]
         port: u16,
+        #[arg(long, help = "Path to SQLite database")]
+        db: Option<String>,
     },
     Crawl {
         #[arg(help = "Seed URLs to crawl and analyze")]
@@ -46,6 +50,14 @@ enum Commands {
     Daemon {
         #[arg(short = 'f', long, default_value = "thorn.toml", help = "Path to config file")]
         config: String,
+    },
+    Api {
+        #[arg(short, long, default_value = "3001")]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value = "./thorn-data/thorn.db", help = "Path to SQLite database")]
+        db: String,
     },
 }
 
@@ -85,7 +97,7 @@ async fn main() {
             chain,
             rpc_url,
         } => run_track(wallet, chain, rpc_url).await,
-        Commands::Honeypot { port } => run_honeypot(port).await,
+        Commands::Honeypot { port, db } => run_honeypot(port, db).await,
         Commands::Crawl {
             urls,
             depth,
@@ -96,6 +108,16 @@ async fn main() {
                 Ok(cfg) => daemon::run_daemon(cfg).await,
                 Err(e) => Err(format!("failed to load config {}: {}", config_path, e).into()),
             }
+        }
+        Commands::Api { port, bind, db } => {
+            let thorn_db = match ThornDb::open(&db) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("failed to open database {}: {}", db, e);
+                    std::process::exit(1);
+                }
+            };
+            api::run_api(&bind, port, thorn_db).await
         }
     };
 
@@ -253,8 +275,18 @@ async fn run_track(
     Ok(())
 }
 
-async fn run_honeypot(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let state = Arc::new(HoneypotState::new());
+async fn run_honeypot(port: u16, db_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut honeypot_state = HoneypotState::new();
+
+    if let Some(ref path) = db_path {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let db = ThornDb::open(path)?;
+        honeypot_state = honeypot_state.with_db(db);
+    }
+
+    let state = Arc::new(honeypot_state);
     let router = honeypot_router(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;

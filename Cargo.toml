@@ -2,10 +2,14 @@
 resolver = "2"
 members = [
     "crates/thorn-core",
+    "crates/thorn-db",
     "crates/thorn-detect",
     "crates/thorn-chain",
     "crates/thorn-honeypot",
     "crates/thorn-guard",
+    "crates/thorn-notify",
+    "crates/thorn-archive",
+    "crates/thorn-capture",
     "crates/thorn-cli",
 ]
 
@@ -16,10 +20,14 @@ license = "MIT"
 
 [workspace.dependencies]
 thorn-core = { path = "crates/thorn-core" }
+thorn-db = { path = "crates/thorn-db" }
 thorn-detect = { path = "crates/thorn-detect" }
 thorn-chain = { path = "crates/thorn-chain" }
 thorn-honeypot = { path = "crates/thorn-honeypot" }
 thorn-guard = { path = "crates/thorn-guard" }
+thorn-notify = { path = "crates/thorn-notify" }
+thorn-archive = { path = "crates/thorn-archive" }
+thorn-capture = { path = "crates/thorn-capture" }
 
 slither-core = { git = "https://github.com/plyght/slither", branch = "master" }
 snake = { git = "https://github.com/plyght/slither", branch = "master" }
@@ -41,6 +49,9 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "0.8"
 regex = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+rust-s3 = "0.37"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 opt-level = 3

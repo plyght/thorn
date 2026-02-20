@@ -129,3 +129,108 @@ pub struct InfraFingerprint {
     pub has_x402: bool,
     pub conway_indicators: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredTarget {
+    pub url: String,
+    pub source: DiscoverySource,
+    pub discovered_at: DateTime<Utc>,
+    pub priority: f64,
+    pub scanned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DiscoverySource {
+    HoneypotHit { wallet: String },
+    WalletTrace { parent_wallet: String },
+    CrawlLink { found_on: String },
+    CanaryDetection { canary_token: String },
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertEvent {
+    pub id: String,
+    pub severity: AlertSeverity,
+    pub kind: AlertKind,
+    pub title: String,
+    pub detail: String,
+    pub timestamp: DateTime<Utc>,
+    pub metadata: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlertSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AlertKind {
+    BotDetected {
+        url: String,
+        score: f64,
+    },
+    WalletDiscovered {
+        address: String,
+        chain: Chain,
+    },
+    HoneypotHitReceived {
+        endpoint: String,
+        ip: String,
+    },
+    HighThreatScore {
+        target: String,
+        score: f64,
+    },
+    AutomatonTracked {
+        wallet: String,
+        status: AutomatonStatus,
+    },
+    CanaryTriggered {
+        token: String,
+        found_at: String,
+    },
+    CaptureEvent {
+        wallet: String,
+        amount: f64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureStrategy {
+    pub kind: CaptureKind,
+    pub target_wallet: String,
+    pub active: bool,
+    pub total_captured: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CaptureKind {
+    EscalatingPrices {
+        base_price: f64,
+        multiplier: f64,
+        max_price: f64,
+    },
+    DomainSnipe {
+        domain: String,
+        expiry: Option<DateTime<Utc>>,
+    },
+    DataPoisoning {
+        endpoint: String,
+        poison_ratio: f64,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanRecord {
+    pub id: String,
+    pub url: String,
+    pub domain: String,
+    pub score: f64,
+    pub classification: String,
+    pub signals: Vec<BotSignal>,
+    pub scanned_at: DateTime<Utc>,
+}

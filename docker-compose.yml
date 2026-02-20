@@ -1,13 +1,43 @@
 services:
-  thorn:
+  thorn-daemon:
     build: .
-    ports:
-      - "3000:3000"
+    command: ["daemon", "-f", "/etc/thorn/thorn.toml"]
     volumes:
       - ./thorn.toml:/etc/thorn/thorn.toml:ro
       - thorn-data:/data
     environment:
       - RUST_LOG=thorn=info
+    restart: unless-stopped
+    depends_on:
+      - cloudflared
+
+  thorn-honeypot:
+    build: .
+    command: ["honeypot", "--port", "3000", "--db", "/data/thorn.db"]
+    ports:
+      - "3000:3000"
+    volumes:
+      - thorn-data:/data
+    environment:
+      - RUST_LOG=thorn=info
+    restart: unless-stopped
+
+  thorn-api:
+    build: .
+    command: ["api", "--port", "3001", "--bind", "0.0.0.0", "--db", "/data/thorn.db"]
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - thorn-data:/data
+    environment:
+      - RUST_LOG=thorn=info
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
     restart: unless-stopped
 
 volumes:

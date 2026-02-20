@@ -11,6 +11,18 @@ pub enum ThornError {
     #[error("honeypot error: {0}")]
     Honeypot(String),
 
+    #[error("database error: {0}")]
+    Database(String),
+
+    #[error("archive error: {0}")]
+    Archive(String),
+
+    #[error("notify error: {0}")]
+    Notify(String),
+
+    #[error("capture error: {0}")]
+    Capture(String),
+
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
