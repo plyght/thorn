@@ -24,10 +24,10 @@ watch_wallets = []
 interval_secs = 300
 
 [output]
-results_dir = "/data"
+results_dir = "./thorn-data"
 
 [db]
-path = "/data/thorn.db"
+path = "./thorn-data/thorn.db"
 
 [api]
 port = 3001
