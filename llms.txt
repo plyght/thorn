@@ -11,14 +11,14 @@ Thorn shares crawler/extraction crates from **Slither** (~/slither), a Rust sear
 |-------|---------|
 | `thorn-core` | Types: BotSignal, BotScore, AutomatonProfile, WalletInfo, X402Transaction, HoneypotHit, DomainIntel, InfraFingerprint, AlertEvent, AlertSeverity, AlertKind, DiscoveredTarget, DiscoverySource, CaptureStrategy, CaptureKind, ScanRecord. Error types via thiserror. |
 | `thorn-detect` | Detection engine. `content.rs` — AI content fingerprinting (perplexity, burstiness, structural homogeneity). `infra.rs` — infrastructure signal analysis (x402 headers, Conway indicators, server fingerprints). `scoring.rs` — aggregate signals into BotScore with classification. `behavioral.rs` — timing anomaly detection, automation framework artifacts, request pattern fingerprinting. |
-| `thorn-chain` | On-chain wallet tracking. `tracker.rs` — WalletTracker for Base/Solana/Ethereum RPC. Traces funding chains, builds AutomatonProfile from wallet behavior. |
+| `thorn-chain` | On-chain wallet tracking. `tracker.rs` — WalletTracker for Base/Solana/Ethereum RPC. Traces funding chains, builds AutomatonProfile from wallet behavior. `scanner.rs` — X402Scanner: real-time Base USDC Transfer event polling via eth_getLogs. Discovers bot wallets by monitoring x402 payment flow on-chain. Configurable poll interval, tracks last processed block, filters transfers $0.001–$100 USDC range. |
 | `thorn-honeypot` | Honeypot server. `server.rs` — Axum HTTP server with fake x402-paywalled API endpoints. Persists hits to SQLite via ThornDb, dispatches alerts via Notifier. `trap.rs` — AutoGuard-style defensive prompt injection + canary token generation. |
 | `thorn-guard` | Defensive DOM injection. `inject.rs` — Embeds invisible prompt-injection payloads and canary tokens into HTML that trigger LLM safety mechanisms (80%+ success rate per AutoGuard paper arXiv:2511.13725). |
 | `thorn-db` | SQLite persistence layer. `schema.rs` — 9 tables (scan_results, wallets, wallet_children, honeypot_hits, domains, discovered_targets, canary_tokens, x402_transactions, capture_strategies) + 11 indexes. `ops.rs` — ThornDb struct with CRUD operations, WAL mode, clone_handle() for sharing across tasks. |
 | `thorn-notify` | Alerting system. `webhook.rs` — WebhookNotifier (generic + Slack-formatted payloads). `ntfy.rs` — NtfyNotifier (ntfy.sh mobile push, free, no signup). Unified Notifier facade. |
 | `thorn-archive` | R2 archival via rust-s3. `r2.rs` — R2Archive with upload_json, archive_honeypot_hits, archive_scan_results, archive_evidence. Uses Region::R2 with path-style addressing. |
 | `thorn-capture` | Layer 5 resource capture. `drain.rs` — DrainEngine (escalating x402 prices per wallet). `poison.rs` — PoisonGenerator (fake market/analytics/price data). `domains.rs` — DomainMonitor (RDAP expiry checking for bot-registered domains). |
-| `thorn-cli` | CLI binary. Commands: `scan`, `track`, `honeypot`, `crawl`, `daemon`, `api`. Daemon runs all subsystems (honeypot + scan/crawl/track schedulers + discovery loop + R2 archival). API provides read/write query interface. |
+| `thorn-cli` | CLI binary. Commands: `scan`, `track`, `honeypot`, `crawl`, `daemon`, `api`. Daemon runs all subsystems continuously (honeypot + x402 scanner + scan/crawl/track continuous loops + discovery loop + R2 archival). No sleep intervals — all loops poll DB work queues every 5-10s. API provides read/write query interface + capture toggle endpoints. |
 
 ### External Dependencies (from Slither)
 - `slither-core` — RawPage, Document, CrawlerConfig types
@@ -40,8 +40,8 @@ Thorn shares crawler/extraction crates from **Slither** (~/slither), a Rust sear
 ### Three-Process Deployment Model
 
 1. **Honeypot** (port 3000, public via CF Tunnel) — Inbound trap. Serves fake x402 endpoints, records hits, alerts on wallet-bearing visitors.
-2. **Daemon** (background) — Outbound scanner. Scheduled scan/crawl/track loops, discovery feedback loop (honeypot hit → wallet → trace → discover domains → scan), R2 periodic archival.
-3. **API** (port 3001, internal only) — Query interface. GET /api/stats, /api/scans, /api/wallets, /api/hits, /api/targets. POST /api/wallets to add watch wallets.
+2. **Daemon** (background) — Autonomous hunter. Continuous loops: x402 chain scanner (real-time USDC transfer monitoring → wallet discovery), scan/crawl/track loops polling DB work queues every 5-10s (no fixed intervals), discovery feedback loop (honeypot hit → wallet → trace → discover domains → auto-feed as crawl seeds → scan), R2 periodic archival. `Arc<AtomicBool>` capture toggle shared with API.
+3. **API** (port 3001, internal only) — Query interface. GET /api/stats, /api/scans, /api/wallets, /api/hits, /api/targets, /api/capture/status. POST /api/wallets to add watch wallets, POST /api/capture/toggle to enable/disable capture system at runtime.
 
 All three share SQLite via WAL mode. Deployed on Hetzner CX22 VPS (~$4.50/mo) as systemd services with Caddy reverse proxy and cloudflared for CF Tunnel — same pattern as Slither.
 
@@ -92,7 +92,7 @@ Single binary, three systemd units sharing `/var/lib/thorn/thorn.db`:
 - R2 archival configured in thorn.toml, rclone sync as backup
 
 ### Status
-Production-ready. All 10 crates implemented, zero `todo!()` stubs. Build passes clean (0 errors, 0 warnings). Detection engine covers content (entropy, burstiness, structural homogeneity, AI phrase matching), infrastructure (x402, Conway indicators, server fingerprints), and behavioral (timing anomalies, automation artifacts, header patterns) signals. Chain tracker makes live RPC calls to Base/Solana/Ethereum. Honeypot serves convincing fake x402 marketplace with AutoGuard prompt injection and canary tokens. Daemon runs discovery feedback loop. Not yet deployed.
+Production-deployed on Hetzner CX22 (157.180.74.167). All 10 crates implemented, zero `todo!()` stubs. Fully autonomous — no manual seeding required. X402 scanner watches Base USDC transfers in real-time, discovered wallets auto-trigger tracking, discovered domains auto-feed as crawl seeds. Capture/drain system toggleable at runtime via API (off by default). Detection engine covers content, infrastructure, and behavioral signals. Daemon runs continuous work-queue loops (5-10s polls, no fixed intervals).
 
 ### Conventions
 - Rust 2021 edition, workspace dependencies, MIT license

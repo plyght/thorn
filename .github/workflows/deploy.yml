@@ -1,0 +1,63 @@
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'thorn.toml'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Deploy binary
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: target/release/thorn
+          target: /tmp/
+          strip_components: 2
+
+      - name: Install and restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: DEPLOY_PASSWORD
+          script: |
+            echo "$DEPLOY_PASSWORD" | sudo -S cp /tmp/thorn /usr/local/bin/thorn.new
+            echo "$DEPLOY_PASSWORD" | sudo -S chmod +x /usr/local/bin/thorn.new
+            echo "$DEPLOY_PASSWORD" | sudo -S mv /usr/local/bin/thorn.new /usr/local/bin/thorn
+            echo "$DEPLOY_PASSWORD" | sudo -S systemctl restart thorn-daemon
+            echo "$DEPLOY_PASSWORD" | sudo -S systemctl restart thorn-api
+            sleep 3
+            curl -sf http://localhost:3001/health || echo "API health check failed"
+            rm -f /tmp/thorn
+          env:
+            DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}

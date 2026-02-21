@@ -52,3 +52,8 @@ bind = "127.0.0.1"
 # drain_multiplier = 1.5
 # drain_max_price = 10.0
 # monitor_domains = []
+
+[scanner]
+enabled = true
+rpc_url = "https://mainnet.base.org"
+poll_interval_ms = 2000

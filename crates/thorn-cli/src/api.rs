@@ -6,12 +6,14 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thorn_db::ThornDb;
 use tracing::info;
 
 pub struct ApiState {
     pub db: ThornDb,
+    pub capture_enabled: Arc<AtomicBool>,
 }
 
 pub fn api_router(state: Arc<ApiState>) -> Router {
@@ -22,6 +24,8 @@ pub fn api_router(state: Arc<ApiState>) -> Router {
         .route("/api/wallets", post(add_wallet_handler))
         .route("/api/hits", get(hits_handler))
         .route("/api/targets", get(targets_handler))
+        .route("/api/capture/status", get(capture_status_handler))
+        .route("/api/capture/toggle", post(capture_toggle_handler))
         .route("/health", get(health_handler))
         .with_state(state)
 }
@@ -121,8 +125,41 @@ async fn targets_handler(
     Ok(Json(serde_json::to_value(&targets).unwrap_or_default()))
 }
 
-pub async fn run_api(bind: &str, port: u16, db: ThornDb) -> Result<(), Box<dyn std::error::Error>> {
-    let state = Arc::new(ApiState { db });
+async fn capture_status_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Json<serde_json::Value> {
+    let enabled = state.capture_enabled.load(Ordering::Relaxed);
+    Json(serde_json::json!({ "enabled": enabled }))
+}
+
+#[derive(Deserialize)]
+struct CaptureToggleBody {
+    enabled: bool,
+}
+
+async fn capture_toggle_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(body): Json<CaptureToggleBody>,
+) -> Json<serde_json::Value> {
+    let prev = state.capture_enabled.swap(body.enabled, Ordering::Relaxed);
+    info!(
+        previous = prev,
+        current = body.enabled,
+        "capture toggle changed"
+    );
+    Json(serde_json::json!({
+        "previous": prev,
+        "enabled": body.enabled,
+    }))
+}
+
+pub async fn run_api(
+    bind: &str,
+    port: u16,
+    db: ThornDb,
+    capture_enabled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(ApiState { db, capture_enabled });
     let router = api_router(state);
 
     let addr = format!("{}:{}", bind, port);

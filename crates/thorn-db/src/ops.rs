@@ -395,6 +395,19 @@ impl ThornDb {
         })
     }
 
+    pub fn get_domain_urls_for_crawl(&self) -> ThornResult<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT domain FROM domains WHERE domain IS NOT NULL AND domain != '' ORDER BY last_scanned ASC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let d: String = row.get(0)?;
+                Ok(format!("https://{}", d))
+            })?;
+            rows.collect()
+        })
+    }
+
     pub fn stats(&self) -> ThornResult<DbStats> {
         self.with_conn(|conn| {
             let scans: i64 =

@@ -13,6 +13,7 @@ pub struct ThornConfig {
     pub r2: Option<R2Config>,
     pub api: Option<ApiConfig>,
     pub capture: Option<CaptureConfig>,
+    pub scanner: Option<ScannerConfig>,
 }
 
 #[derive(Deserialize)]
@@ -24,6 +25,7 @@ pub struct HoneypotConfig {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct ScanConfig {
     pub targets: Vec<String>,
     #[serde(default = "default_scan_interval")]
@@ -31,6 +33,7 @@ pub struct ScanConfig {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct CrawlConfig {
     pub seeds: Vec<String>,
     #[serde(default = "default_crawl_depth")]
@@ -42,6 +45,7 @@ pub struct CrawlConfig {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 pub struct TrackConfig {
     #[serde(default = "default_chain")]
     pub chain: String,
@@ -108,6 +112,16 @@ pub struct CaptureConfig {
     pub monitor_domains: Vec<String>,
 }
 
+#[derive(Deserialize)]
+pub struct ScannerConfig {
+    #[serde(default = "default_scanner_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_scanner_rpc_url")]
+    pub rpc_url: String,
+    #[serde(default = "default_scanner_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+}
+
 fn default_honeypot_port() -> u16 {
     3000
 }
@@ -161,6 +175,15 @@ fn default_drain_multiplier() -> f64 {
 }
 fn default_drain_max_price() -> f64 {
     10.0
+}
+fn default_scanner_enabled() -> bool {
+    true
+}
+fn default_scanner_rpc_url() -> String {
+    "https://mainnet.base.org".to_string()
+}
+fn default_scanner_poll_interval_ms() -> u64 {
+    2000
 }
 
 impl ThornConfig {

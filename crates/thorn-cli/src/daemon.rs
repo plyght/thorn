@@ -2,8 +2,10 @@ use crate::config::ThornConfig;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thorn_archive::R2Archive;
+use thorn_chain::scanner::X402Scanner;
 use thorn_chain::tracker::WalletTracker;
 use thorn_core::{AlertEvent, AlertKind, AlertSeverity, Chain, ScanRecord};
 use thorn_db::ThornDb;
@@ -31,7 +33,16 @@ fn default_rpc(chain: &Chain) -> &'static str {
     }
 }
 
-pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub fn make_capture_toggle(config: &ThornConfig) -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(
+        config.capture.as_ref().map(|c| c.enabled).unwrap_or(false),
+    ))
+}
+
+pub async fn run_daemon(
+    config: ThornConfig,
+    capture_enabled: Arc<AtomicBool>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let results_dir = PathBuf::from(&config.output.results_dir);
     std::fs::create_dir_all(&results_dir)?;
 
@@ -83,7 +94,10 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
         }
     }
 
-    info!("starting thorn daemon");
+    info!(
+        capture = capture_enabled.load(Ordering::Relaxed),
+        "starting thorn daemon"
+    );
 
     let honeypot_state = Arc::new(
         HoneypotState::new()
@@ -106,10 +120,74 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
         }
     });
 
+    let scanner_handle = {
+        let scanner_cfg = config.scanner.as_ref();
+        let enabled = scanner_cfg.map(|s| s.enabled).unwrap_or(true);
+        if enabled {
+            let rpc_url = scanner_cfg
+                .map(|s| s.rpc_url.clone())
+                .unwrap_or_else(|| "https://mainnet.base.org".to_string());
+            let poll_ms = scanner_cfg.map(|s| s.poll_interval_ms).unwrap_or(2000);
+            let scanner_db = db.clone_handle();
+            let scanner_notifier = notifier.clone();
+            Some(tokio::spawn(async move {
+                let mut scanner = X402Scanner::new(rpc_url, poll_ms);
+                loop {
+                    match scanner.poll_new_transfers().await {
+                        Ok(wallets) => {
+                            for w in &wallets {
+                                let existing = scanner_db.get_wallet_addresses().unwrap_or_default();
+                                if !existing.contains(&w.address) {
+                                    let _ = scanner_db.upsert_wallet(
+                                        &w.address,
+                                        &format!("{:?}", w.chain),
+                                        0.0,
+                                        0,
+                                        "Discovered",
+                                        None,
+                                        0.0,
+                                        0.0,
+                                    );
+
+                                    let event = AlertEvent {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        severity: AlertSeverity::High,
+                                        kind: AlertKind::WalletDiscovered {
+                                            address: w.address.clone(),
+                                            chain: w.chain.clone(),
+                                        },
+                                        title: format!(
+                                            "x402 wallet: {}",
+                                            &w.address[..w.address.len().min(10)]
+                                        ),
+                                        detail: format!(
+                                            "Wallet {} found via x402 USDC transfer ({:.4} USDC) tx:{}",
+                                            w.address, w.amount_usdc, w.tx_hash
+                                        ),
+                                        timestamp: Utc::now(),
+                                        metadata: HashMap::new(),
+                                    };
+                                    let _ = scanner_notifier.send(&event).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "x402 scanner poll failed");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(scanner.poll_interval_ms())).await;
+                }
+            }))
+        } else {
+            info!("x402 scanner disabled");
+            None
+        }
+    };
+
     let discovery_db = db.clone_handle();
     let discovery_notifier = notifier.clone();
     let discovery_handle = tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(30));
+        let mut tick = interval(Duration::from_secs(5));
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (compatible; ThornBot/0.1)")
             .timeout(std::time::Duration::from_secs(30))
@@ -145,7 +223,7 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
                 }
             }
 
-            let targets = discovery_db.get_unscanned_targets(5).unwrap_or_default();
+            let targets = discovery_db.get_unscanned_targets(10).unwrap_or_default();
             for (target_url, _priority) in &targets {
                 info!(url = %target_url, "scanning discovered target");
                 if let Err(e) = scan_and_store(&client, target_url, &discovery_db).await {
@@ -160,9 +238,8 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
         let scan_db = db.clone_handle();
         let scan_notifier = notifier.clone();
         let targets = scan_config.targets;
-        let interval_secs = scan_config.interval_secs;
         Some(tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(interval_secs));
+            let mut tick = interval(Duration::from_secs(10));
             let client = reqwest::Client::builder()
                 .user_agent("Mozilla/5.0 (compatible; ThornBot/0.1)")
                 .timeout(std::time::Duration::from_secs(30))
@@ -170,8 +247,18 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
                 .expect("failed to build http client");
             loop {
                 tick.tick().await;
-                info!("running scheduled scan of {} target(s)", targets.len());
-                for target in &targets {
+                let unscanned = scan_db.get_unscanned_targets(0).unwrap_or_default();
+                let has_work = !unscanned.is_empty();
+                if !has_work && targets.is_empty() {
+                    continue;
+                }
+                let work_targets: Vec<String> = if has_work {
+                    unscanned.into_iter().map(|(url, _)| url).collect()
+                } else {
+                    targets.clone()
+                };
+                info!("scanning {} target(s)", work_targets.len());
+                for target in &work_targets {
                     match scan_and_store(&client, target, &scan_db).await {
                         Ok(Some(score)) if score > 0.6 => {
                             let event = AlertEvent {
@@ -200,18 +287,29 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
 
     let crawl_handle = if let Some(crawl_config) = config.crawl {
         let crawl_db = db.clone_handle();
-        let seeds = crawl_config.seeds;
+        let config_seeds = crawl_config.seeds;
         let depth = crawl_config.depth;
         let concurrent = crawl_config.concurrent;
-        let interval_secs = crawl_config.interval_secs;
         Some(tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(interval_secs));
+            let mut tick = interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
-                info!("running scheduled crawl of {} seed(s)", seeds.len());
+                let mut seeds = config_seeds.clone();
+                if let Ok(domain_urls) = crawl_db.get_domain_urls_for_crawl() {
+                    for url in domain_urls {
+                        if !seeds.contains(&url) {
+                            seeds.push(url);
+                        }
+                    }
+                }
+                if seeds.is_empty() {
+                    continue;
+                }
+                info!("crawling {} seed(s) (config + discovered)", seeds.len());
                 if let Err(e) = crawl_and_store(&seeds, depth, concurrent, &crawl_db).await {
                     warn!("crawl failed: {}", e);
                 }
+                tokio::time::sleep(Duration::from_secs(300)).await;
             }
         }))
     } else {
@@ -226,9 +324,8 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
         let rpc_url = track_config
             .rpc_url
             .unwrap_or_else(|| default_rpc(&chain).to_string());
-        let interval_secs = track_config.interval_secs;
         Some(tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(interval_secs));
+            let mut tick = interval(Duration::from_secs(10));
             let tracker = WalletTracker::new(rpc_url, chain);
             loop {
                 tick.tick().await;
@@ -290,12 +387,16 @@ pub async fn run_daemon(config: ThornConfig) -> Result<(), Box<dyn std::error::E
         hits = stats.honeypot_hits,
         wallets = stats.wallets,
         targets = stats.discovered_targets,
-        "daemon running — honeypot + schedulers + discovery loop active"
+        capture = capture_enabled.load(Ordering::Relaxed),
+        "daemon running — honeypot + continuous loops + x402 scanner active"
     );
 
     tokio::select! {
         _ = honeypot_handle => error!("honeypot task exited"),
         _ = discovery_handle => error!("discovery task exited"),
+        _ = async { if let Some(h) = scanner_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
+            error!("scanner task exited")
+        }
         _ = async { if let Some(h) = scan_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
             error!("scan task exited")
         }
@@ -542,6 +643,15 @@ async fn track_and_store(
 
     for child in &profile.children_wallets {
         let _ = db.insert_wallet_child(wallet, child);
+    }
+
+    for domain in &profile.domains {
+        let _ = db.insert_discovered_target(
+            &format!("https://{}", domain),
+            "WalletTrace",
+            wallet,
+            0.8,
+        );
     }
 
     let x402_txs = tracker.get_x402_transactions(wallet).await.unwrap_or_default();

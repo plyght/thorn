@@ -105,7 +105,10 @@ async fn main() {
         } => run_crawl(urls, depth, concurrent).await,
         Commands::Daemon { config: config_path } => {
             match config::ThornConfig::from_file(&config_path) {
-                Ok(cfg) => daemon::run_daemon(cfg).await,
+                Ok(cfg) => {
+                    let capture_toggle = daemon::make_capture_toggle(&cfg);
+                    daemon::run_daemon(cfg, capture_toggle).await
+                }
                 Err(e) => Err(format!("failed to load config {}: {}", config_path, e).into()),
             }
         }
@@ -117,7 +120,8 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            api::run_api(&bind, port, thorn_db).await
+            let capture_toggle = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            api::run_api(&bind, port, thorn_db, capture_toggle).await
         }
     };
 
