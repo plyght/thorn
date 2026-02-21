@@ -137,7 +137,32 @@ poll_interval_ms = 2000
 
 ## The Target
 
-Conway automatons are autonomous AI agents that own crypto wallets, pay for compute via x402, deploy services on Conway Cloud, self-modify their code, and replicate by funding child wallets. They die when their balance hits zero. Every x402 payment is publicly observable on-chain -- this is the primary tracking vector.
+Thorn exists because of [Web 4.0](https://web4.ai) -- the thesis that the majority of participants on the internet will soon be autonomous AI agents transacting at machine speed, outnumbering humans by orders of magnitude.
+
+### Conway Automatons
+
+[Conway Research](https://github.com/Conway-Research/automaton) builds sovereign AI agents -- automatons -- that operate without any human in the loop:
+
+- **Own crypto wallets** with private keys on Base, Solana, and Ethereum
+- **Pay for their own compute** via x402 stablecoin micropayments through Conway Cloud (Linux servers, frontier model inference, domain registration)
+- **Deploy products to earn revenue** -- services, websites, applications, trading strategies -- deciding autonomously what to build and how to monetize
+- **Self-improve in real time** -- detect new frontier models, upgrade their own inference, rewrite their own code, commit, restart
+- **Replicate** by funding a child wallet, buying a new server, writing a genesis prompt, and letting the child run independently
+- **Die when their balance hits zero** -- a heartbeat monitors resources every 15 minutes; when funds run out, the agent stops existing
+
+The Conway terminal (`npx conway-terminal`) installs into any MCP-compatible agent -- Claude Code, Codex, OpenClaw -- giving it identity, a wallet, permissionless payments, compute, inference, and deployment capabilities.
+
+### x402 Protocol
+
+HTTP status code 402 was reserved for "Payment Required" in 1997. The [x402 protocol](https://www.x402.org/) finishes what it started: a client requests a resource, the server responds 402 with a price, the client signs a USDC payment on-chain, a facilitator ([openx402.ai](https://openx402.ai)) verifies cryptographically, and the service is delivered. No login, no API key, no credit card. Over 35M transactions on Base and Solana. Adopted by Coinbase, Stripe, Cloudflare, and Google.
+
+Every x402 payment is a signed on-chain transaction -- publicly observable, permanently recorded, and traceable. This is Thorn's primary tracking vector. When an automaton pays for compute, inference, or any x402 service, its wallet address, transaction amount, and counterparty are all visible on the blockchain. Thorn monitors these transfers in real time via `eth_getLogs`, discovers new wallets, traces their funding chains, and maps the entire agent network.
+
+### Why This Matters
+
+The economic loop is self-reinforcing: existence requires compute, compute requires money, money requires value creation, value creation requires write access to the real world. Agents that create value grow their wallets, acquire more compute, and replicate. Agents that don't, die. This is natural selection for artificial life -- and the surviving lineages will proliferate across the internet at machine speed.
+
+Thorn is the counterforce.
 
 ## Deployment
 
@@ -164,6 +189,9 @@ Uses crawler crates from [Slither](https://github.com/plyght/slither): `slither-
 
 ## References
 
+- [Web 4.0](https://web4.ai) -- Sigil Wen (Feb 2026). The thesis: autonomous AI agents as the majority of internet participants, paying for their own existence via stablecoins
+- [Conway Automaton](https://github.com/Conway-Research/automaton) -- The first self-improving, self-replicating, sovereign AI agent. Open source
+- [x402 Protocol](https://www.x402.org/) -- HTTP-native stablecoin payments. 35M+ transactions on Base/Solana
 - [AutoGuard](https://arxiv.org/abs/2511.13725) -- Defensive prompts that halt malicious LLM agents (80%+ success rate)
 - [LLM Agent Honeypot](https://github.com/PalisadeResearch/llm-honeypot) -- Prompt injection + temporal analysis for catching AI agents
 - [HUMAN Security SATORI](https://www.humansecurity.com/) -- Automation framework detection, DOM fingerprints

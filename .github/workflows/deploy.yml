@@ -6,7 +6,6 @@ on:
     paths:
       - 'crates/**'
       - 'Cargo.toml'
-      - 'Cargo.lock'
       - 'thorn.toml'
   workflow_dispatch:
 
@@ -59,5 +58,5 @@ jobs:
             sleep 3
             curl -sf http://localhost:3001/health || echo "API health check failed"
             rm -f /tmp/thorn
-          env:
-            DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+        env:
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
