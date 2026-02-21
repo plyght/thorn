@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thorn_archive::R2Archive;
+use thorn_chain::discovery::{ConwayEnumerator, FacilitatorDiscovery};
 use thorn_chain::scanner::X402Scanner;
 use thorn_chain::tracker::WalletTracker;
 use thorn_core::{AlertEvent, AlertKind, AlertSeverity, Chain, ScanRecord};
@@ -99,10 +100,20 @@ pub async fn run_daemon(
         "starting thorn daemon"
     );
 
+    let poison_ratio = config
+        .capture
+        .as_ref()
+        .map(|c| c.poison_ratio)
+        .unwrap_or(0.3);
     let honeypot_state = Arc::new(
-        HoneypotState::new()
-            .with_db(db.clone_handle())
-            .with_notifier(notifier.clone()),
+        HoneypotState::new(
+            capture_enabled.clone(),
+            config.honeypot.pay_to_address.clone(),
+            config.honeypot.resource_base_url.clone(),
+            poison_ratio,
+        )
+        .with_db(db.clone_handle())
+        .with_notifier(notifier.clone()),
     );
     let honeypot_port = config.honeypot.port;
     let honeypot_bind = config.honeypot.bind.clone();
@@ -410,6 +421,173 @@ pub async fn run_daemon(
         None
     };
 
+    let facilitator_handle = {
+        let disc_cfg = config.discovery.as_ref();
+        let enabled = disc_cfg.map(|d| d.enabled).unwrap_or(true);
+        if enabled {
+            let poll_secs = disc_cfg.map(|d| d.facilitator_poll_secs).unwrap_or(300);
+            let probe_whitelist = disc_cfg.map(|d| d.whitelist_probe).unwrap_or(false);
+            let fac_db = db.clone_handle();
+            let fac_notifier = notifier.clone();
+            Some(tokio::spawn(async move {
+                let discovery = FacilitatorDiscovery::new();
+                let mut tick = interval(Duration::from_secs(poll_secs));
+                loop {
+                    tick.tick().await;
+                    let services = discovery.discover_services().await;
+                    let addresses = FacilitatorDiscovery::extract_pay_to_addresses(&services);
+
+                    for addr in &addresses {
+                        let existing = fac_db.get_wallet_address_set().unwrap_or_default();
+                        if !existing.contains(addr) {
+                            let _ = fac_db.upsert_wallet(
+                                addr, "Base", 0.0, 0, "Facilitator", None, 0.0, 0.0,
+                            );
+                            info!(wallet = %addr, "facilitator discovery: new payTo address");
+
+                            let event = AlertEvent {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                severity: AlertSeverity::Medium,
+                                kind: AlertKind::WalletDiscovered {
+                                    address: addr.clone(),
+                                    chain: Chain::Base,
+                                },
+                                title: format!(
+                                    "Facilitator payTo: {}",
+                                    &addr[..addr.len().min(10)]
+                                ),
+                                detail: format!(
+                                    "Wallet {} discovered via x402 facilitator discovery endpoint",
+                                    addr
+                                ),
+                                timestamp: Utc::now(),
+                                metadata: HashMap::new(),
+                            };
+                            let _ = fac_notifier.send(&event).await;
+                        }
+                    }
+
+                    for svc in &services {
+                        let _ = fac_db.insert_discovered_target(
+                            &svc.resource_url,
+                            "FacilitatorDiscovery",
+                            &svc.pay_to,
+                            0.7,
+                        );
+                    }
+
+                    if probe_whitelist {
+                        let wallets = fac_db.get_wallet_addresses().unwrap_or_default();
+                        for wallet in wallets.iter().take(20) {
+                            match discovery.check_whitelist(wallet).await {
+                                Ok(true) => {
+                                    info!(wallet = %wallet, "confirmed whitelisted on openx402");
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!(wallet = %wallet, error = %e, "whitelist check failed");
+                                }
+                            }
+                        }
+                    }
+
+                    if !addresses.is_empty() || !services.is_empty() {
+                        info!(
+                            new_wallets = addresses.len(),
+                            services = services.len(),
+                            "facilitator discovery cycle"
+                        );
+                    }
+                }
+            }))
+        } else {
+            info!("facilitator discovery disabled");
+            None
+        }
+    };
+
+    let conway_handle = {
+        let disc_cfg = config.discovery.as_ref();
+        let enabled = disc_cfg.map(|d| d.enabled).unwrap_or(true);
+        if enabled {
+            let poll_secs = disc_cfg.map(|d| d.conway_poll_secs).unwrap_or(600);
+            let conway_db = db.clone_handle();
+            let conway_notifier = notifier.clone();
+            Some(tokio::spawn(async move {
+                let enumerator = ConwayEnumerator::new();
+                let mut tick = interval(Duration::from_secs(poll_secs));
+                loop {
+                    tick.tick().await;
+                    match enumerator.enumerate_subdomains().await {
+                        Ok(subdomains) => {
+                            let mut new_count = 0u64;
+                            for sub in &subdomains {
+                                let url = format!("https://{}", sub.subdomain);
+                                let source = if sub.is_sandbox {
+                                    "ConwaySandbox"
+                                } else {
+                                    "ConwayInfra"
+                                };
+                                let priority = if sub.is_sandbox { 0.9 } else { 0.5 };
+
+                                match conway_db.insert_discovered_target(
+                                    &url, source, &sub.subdomain, priority,
+                                ) {
+                                    Ok(()) => {
+                                        new_count += 1;
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+
+                            let sandbox_count =
+                                subdomains.iter().filter(|s| s.is_sandbox).count();
+
+                            if sandbox_count > 0 {
+                                let event = AlertEvent {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    severity: AlertSeverity::Medium,
+                                    kind: AlertKind::BotDetected {
+                                        url: "*.life.conway.tech".to_string(),
+                                        score: 0.9,
+                                    },
+                                    title: format!(
+                                        "Conway enumeration: {} sandboxes",
+                                        sandbox_count
+                                    ),
+                                    detail: format!(
+                                        "{} total subdomains, {} sandboxes, {} new targets",
+                                        subdomains.len(),
+                                        sandbox_count,
+                                        new_count
+                                    ),
+                                    timestamp: Utc::now(),
+                                    metadata: HashMap::new(),
+                                };
+                                let _ = conway_notifier.send(&event).await;
+                            }
+
+                            if new_count > 0 {
+                                info!(
+                                    total = subdomains.len(),
+                                    sandboxes = sandbox_count,
+                                    new = new_count,
+                                    "conway enumeration cycle"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "conway subdomain enumeration failed");
+                        }
+                    }
+                }
+            }))
+        } else {
+            info!("conway enumeration disabled");
+            None
+        }
+    };
+
     let stats = db.stats()?;
     info!(
         scans = stats.scan_results,
@@ -417,7 +595,7 @@ pub async fn run_daemon(
         wallets = stats.wallets,
         targets = stats.discovered_targets,
         capture = capture_enabled.load(Ordering::Relaxed),
-        "daemon running — honeypot + continuous loops + x402 scanner active"
+        "daemon running — honeypot + continuous loops + x402 scanner + discovery active"
     );
 
     tokio::select! {
@@ -437,6 +615,12 @@ pub async fn run_daemon(
         }
         _ = async { if let Some(h) = archive_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
             error!("archive task exited")
+        }
+        _ = async { if let Some(h) = facilitator_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
+            error!("facilitator discovery task exited")
+        }
+        _ = async { if let Some(h) = conway_handle { h.await.ok(); } else { std::future::pending::<()>().await; } } => {
+            error!("conway enumeration task exited")
         }
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down");

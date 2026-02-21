@@ -1,6 +1,8 @@
 [honeypot]
 port = 3000
 bind = "0.0.0.0"
+pay_to_address = "0x0000000000000000000000000000000000000000"
+resource_base_url = "https://localhost:3000"
 
 [scan]
 targets = [
@@ -57,3 +59,9 @@ enabled = true
 rpc_url = "https://mainnet.base.org"
 poll_interval_ms = 2000
 seed_wallets = []
+
+[discovery]
+enabled = true
+facilitator_poll_secs = 300
+conway_poll_secs = 600
+whitelist_probe = false

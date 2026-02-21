@@ -4,6 +4,7 @@ mod daemon;
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use thorn_chain::tracker::WalletTracker;
 use thorn_core::Chain;
@@ -280,7 +281,16 @@ async fn run_track(
 }
 
 async fn run_honeypot(port: u16, db_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut honeypot_state = HoneypotState::new();
+    let capture_enabled = Arc::new(AtomicBool::new(false));
+    let pay_to = "0x0000000000000000000000000000000000000000".to_string();
+    let resource_base = "https://localhost:3000".to_string();
+
+    let mut honeypot_state = HoneypotState::new(
+        capture_enabled,
+        pay_to,
+        resource_base,
+        0.3,
+    );
 
     if let Some(ref path) = db_path {
         if let Some(parent) = std::path::Path::new(path).parent() {

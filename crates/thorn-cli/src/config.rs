@@ -14,6 +14,7 @@ pub struct ThornConfig {
     pub api: Option<ApiConfig>,
     pub capture: Option<CaptureConfig>,
     pub scanner: Option<ScannerConfig>,
+    pub discovery: Option<DiscoveryConfig>,
 }
 
 #[derive(Deserialize)]
@@ -22,6 +23,10 @@ pub struct HoneypotConfig {
     pub port: u16,
     #[serde(default = "default_honeypot_bind")]
     pub bind: String,
+    #[serde(default = "default_pay_to_address")]
+    pub pay_to_address: String,
+    #[serde(default = "default_resource_base_url")]
+    pub resource_base_url: String,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +129,19 @@ pub struct ScannerConfig {
     pub seed_wallets: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct DiscoveryConfig {
+    #[serde(default = "default_discovery_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_facilitator_poll_secs")]
+    pub facilitator_poll_secs: u64,
+    #[serde(default = "default_conway_poll_secs")]
+    pub conway_poll_secs: u64,
+    #[serde(default = "default_whitelist_probe")]
+    pub whitelist_probe: bool,
+}
+
 fn default_honeypot_port() -> u16 {
     3000
 }
@@ -186,6 +204,24 @@ fn default_scanner_rpc_url() -> String {
 }
 fn default_scanner_poll_interval_ms() -> u64 {
     2000
+}
+fn default_pay_to_address() -> String {
+    "0x0000000000000000000000000000000000000000".to_string()
+}
+fn default_resource_base_url() -> String {
+    "https://localhost:3000".to_string()
+}
+fn default_discovery_enabled() -> bool {
+    true
+}
+fn default_facilitator_poll_secs() -> u64 {
+    300
+}
+fn default_conway_poll_secs() -> u64 {
+    600
+}
+fn default_whitelist_probe() -> bool {
+    false
 }
 
 impl ThornConfig {

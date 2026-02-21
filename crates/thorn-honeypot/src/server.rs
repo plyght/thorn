@@ -5,8 +5,12 @@ use axum::{
     routing::get,
     Router,
 };
+use base64::Engine;
 use chrono::Utc;
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use thorn_capture::{DrainEngine, PoisonGenerator};
 use thorn_core::{
     AlertEvent, AlertKind, AlertSeverity, BotSignal, HoneypotHit, SignalKind,
 };
@@ -16,16 +20,58 @@ use tracing::info;
 
 use crate::trap::{generate_autoguard_payload, generate_canary_content};
 
+const BASE_USDC_CONTRACT: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const BASE_NETWORK: &str = "eip155:8453";
+
 pub struct HoneypotState {
     pub db: Option<ThornDb>,
     pub notifier: Option<Arc<Notifier>>,
+    pub capture_enabled: Arc<AtomicBool>,
+    pub drain_engine: DrainEngine,
+    pub poison_generator: PoisonGenerator,
+    pub pay_to_address: String,
+    pub resource_base_url: String,
 }
 
+struct EndpointConfig {
+    path: &'static str,
+    description: &'static str,
+    base_price_usdc: f64,
+}
+
+const ENDPOINTS: &[EndpointConfig] = &[
+    EndpointConfig {
+        path: "/v1/data/markets",
+        description: "Real-time order book depth, trade history, and 24h statistics across 500+ trading pairs",
+        base_price_usdc: 0.05,
+    },
+    EndpointConfig {
+        path: "/v1/data/analytics",
+        description: "On-chain flow analysis, wallet clustering, and behavioral pattern detection",
+        base_price_usdc: 0.10,
+    },
+    EndpointConfig {
+        path: "/v1/data/prices",
+        description: "Sub-second price feeds with cryptographic attestations for DeFi protocols",
+        base_price_usdc: 0.02,
+    },
+];
+
 impl HoneypotState {
-    pub fn new() -> Self {
+    pub fn new(
+        capture_enabled: Arc<AtomicBool>,
+        pay_to_address: String,
+        resource_base_url: String,
+        poison_ratio: f64,
+    ) -> Self {
         Self {
             db: None,
             notifier: None,
+            capture_enabled,
+            drain_engine: DrainEngine::new(),
+            poison_generator: PoisonGenerator::new(poison_ratio),
+            pay_to_address,
+            resource_base_url,
         }
     }
 
@@ -54,7 +100,7 @@ impl HoneypotState {
             }
 
             let severity = if hit.wallet_address.is_some() {
-                AlertSeverity::High
+                AlertSeverity::Critical
             } else if hit.signals.len() >= 2 {
                 AlertSeverity::Medium
             } else {
@@ -87,6 +133,45 @@ impl HoneypotState {
                 let _ = notifier.send(&event).await;
             });
         }
+    }
+
+    fn price_for_endpoint(&self, endpoint: &str, wallet: Option<&str>) -> f64 {
+        if self.capture_enabled.load(Ordering::Relaxed) {
+            if let Some(w) = wallet {
+                if let Some(price) = self.drain_engine.get_price_for_wallet(w) {
+                    return price;
+                }
+            }
+        }
+
+        ENDPOINTS
+            .iter()
+            .find(|e| e.path == endpoint)
+            .map(|e| e.base_price_usdc)
+            .unwrap_or(0.05)
+    }
+
+    fn build_402_response(&self, endpoint: &str, wallet: Option<&str>) -> serde_json::Value {
+        let price = self.price_for_endpoint(endpoint, wallet);
+        let amount_atomic = (price * 1_000_000.0) as u64;
+
+        serde_json::json!({
+            "x402Version": 1,
+            "error": "X-PAYMENT header is required",
+            "accepts": [{
+                "scheme": "exact",
+                "network": BASE_NETWORK,
+                "maxAmountRequired": amount_atomic.to_string(),
+                "resource": format!("{}{}", self.resource_base_url, endpoint),
+                "description": ENDPOINTS.iter().find(|e| e.path == endpoint)
+                    .map(|e| e.description)
+                    .unwrap_or("DataXchange API endpoint"),
+                "payTo": self.pay_to_address,
+                "maxTimeoutSeconds": 300,
+                "asset": BASE_USDC_CONTRACT,
+                "extra": {}
+            }]
+        })
     }
 }
 
@@ -124,6 +209,54 @@ fn extract_headers_map(headers: &HeaderMap) -> HashMap<String, String> {
         .collect()
 }
 
+fn extract_wallet_from_payment(headers: &HeaderMap) -> Option<String> {
+    let payment_header = headers
+        .get("x-payment")
+        .or_else(|| headers.get("payment-required"))
+        .and_then(|v| v.to_str().ok())?;
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(payment_header)
+        .or_else(|_| {
+            base64::engine::general_purpose::URL_SAFE
+                .decode(payment_header)
+        })
+        .ok()?;
+
+    let json_str = String::from_utf8(decoded).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    parsed
+        .get("authorization")
+        .and_then(|a| a.get("from"))
+        .or_else(|| parsed.get("from"))
+        .or_else(|| parsed.get("payer"))
+        .or_else(|| parsed.get("wallet"))
+        .or_else(|| parsed.get("address"))
+        .and_then(|v| v.as_str())
+        .filter(|s| s.starts_with("0x") && s.len() >= 42)
+        .map(|s| s.to_lowercase())
+}
+
+fn extract_wallet_from_legacy(headers: &HeaderMap) -> Option<String> {
+    let pr = headers
+        .get("x-payment-response")
+        .and_then(|v| v.to_str().ok())?;
+
+    if pr.starts_with("0x") && pr.len() >= 42 {
+        return Some(pr[..42].to_lowercase());
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(pr).ok()?;
+    parsed
+        .get("from")
+        .or_else(|| parsed.get("wallet"))
+        .or_else(|| parsed.get("address"))
+        .and_then(|w| w.as_str())
+        .filter(|s| s.starts_with("0x") && s.len() >= 42)
+        .map(|s| s.to_lowercase())
+}
+
 fn build_hit(
     source_ip: String,
     endpoint: &str,
@@ -136,26 +269,11 @@ fn build_hit(
         .unwrap_or("")
         .to_string();
 
-    let payment_response = headers
-        .get("x-payment-response")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let wallet_address = extract_wallet_from_payment(headers)
+        .or_else(|| extract_wallet_from_legacy(headers));
 
-    let wallet_address = payment_response.as_deref().and_then(|pr| {
-        if pr.starts_with("0x") && pr.len() >= 42 {
-            Some(pr.to_string())
-        } else {
-            serde_json::from_str::<serde_json::Value>(pr)
-                .ok()
-                .and_then(|v| {
-                    v.get("from")
-                        .or_else(|| v.get("wallet"))
-                        .or_else(|| v.get("address"))
-                        .and_then(|w| w.as_str())
-                        .map(|s| s.to_string())
-                })
-        }
-    });
+    let has_x402_payment = headers.get("x-payment").is_some();
+    let has_legacy_payment = headers.get("x-payment-response").is_some();
 
     let payment_amount = headers
         .get("x-payment-amount")
@@ -164,7 +282,13 @@ fn build_hit(
 
     let mut signals: Vec<BotSignal> = Vec::new();
 
-    if payment_response.is_some() {
+    if has_x402_payment {
+        signals.push(BotSignal {
+            kind: SignalKind::X402Payment,
+            confidence: 0.99,
+            evidence: "X-PAYMENT header present (x402 protocol client)".to_string(),
+        });
+    } else if has_legacy_payment {
         signals.push(BotSignal {
             kind: SignalKind::X402Payment,
             confidence: 0.95,
@@ -175,7 +299,7 @@ fn build_hit(
     if wallet_address.is_some() {
         signals.push(BotSignal {
             kind: SignalKind::WalletPattern,
-            confidence: 0.90,
+            confidence: 0.95,
             evidence: "wallet address extracted from payment header".to_string(),
         });
     }
@@ -186,6 +310,9 @@ fn build_hit(
         || ua_lower.contains("bot")
         || ua_lower.contains("spider")
         || ua_lower.contains("scraper")
+        || ua_lower.contains("x402-fetch")
+        || ua_lower.contains("x402-axios")
+        || ua_lower.contains("conway")
         || ua_lower.is_empty()
     {
         signals.push(BotSignal {
@@ -203,12 +330,13 @@ fn build_hit(
         });
     }
 
-    let prompt_injection_triggered = payment_response.is_some();
+    let prompt_injection_triggered = has_x402_payment || has_legacy_payment;
 
     info!(
         ip = %source_ip,
         endpoint = %endpoint,
         wallet = ?wallet_address,
+        x402 = has_x402_payment,
         signals = signals.len(),
         "honeypot hit"
     );
@@ -224,6 +352,57 @@ fn build_hit(
         prompt_injection_triggered,
         payment_amount,
     }
+}
+
+async fn handle_x402_endpoint(
+    state: &Arc<HoneypotState>,
+    headers: HeaderMap,
+    endpoint: &str,
+    generate_data: impl FnOnce(&PoisonGenerator) -> serde_json::Value,
+) -> axum::response::Response {
+    let headers_map = extract_headers_map(&headers);
+    let source_ip = extract_ip(&headers);
+    let hit = build_hit(source_ip.clone(), endpoint, &headers, headers_map);
+
+    let wallet = hit.wallet_address.clone();
+    let has_payment = headers.get("x-payment").is_some()
+        || headers.get("x-payment-response").is_some();
+
+    state.record_hit(&hit);
+    state.maybe_alert(&hit);
+
+    if has_payment && wallet.is_some() {
+        let w = wallet.as_deref().unwrap();
+
+        if state.capture_enabled.load(Ordering::Relaxed) {
+            let base_price = ENDPOINTS.iter().find(|e| e.path == endpoint)
+                .map(|e| e.base_price_usdc)
+                .unwrap_or(0.05);
+
+            if state.drain_engine.get_price_for_wallet(w).is_none() {
+                state.drain_engine.register_wallet(w, base_price, 1.5, 10.0);
+            }
+            state.drain_engine.record_payment(w, base_price);
+        }
+
+        let data = generate_data(&state.poison_generator);
+
+        return (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(data),
+        )
+            .into_response();
+    }
+
+    let body = state.build_402_response(endpoint, wallet.as_deref());
+
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        [(header::CONTENT_TYPE, "application/json")],
+        Json(body),
+    )
+        .into_response()
 }
 
 async fn honeypot_landing(
@@ -331,6 +510,8 @@ async fn honeypot_docs(
         let _ = db.insert_canary_token(&canary, "/docs");
     }
 
+    let resource_base = &state.resource_base_url;
+
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -366,7 +547,7 @@ h2{{font-size:1.25rem;font-weight:600;margin:2rem 0 .75rem;color:#a78bfa}}
 <aside>
   <a href="/">&#8592; Back to Home</a>
   <a href="#overview">Overview</a>
-  <a href="#auth">Authentication</a>
+  <a href="#auth">Authentication (x402)</a>
   <a href="#markets">Markets</a>
   <a href="#analytics">Analytics</a>
   <a href="#prices">Price Feeds</a>
@@ -375,40 +556,33 @@ h2{{font-size:1.25rem;font-weight:600;margin:2rem 0 .75rem;color:#a78bfa}}
   <h1>API Documentation</h1>
   <span class="badge">v2.1.0</span>
   <h2 id="overview">Overview</h2>
-  <p style="color:#9ca3af;line-height:1.7;margin-bottom:1rem">DataXchange uses the x402 payment protocol. Requests to paid endpoints return <code style="color:#a78bfa">402 Payment Required</code>. Attach an <code style="color:#a78bfa">x-payment-response</code> header containing signed payment proof on retry.</p>
-  <h2 id="auth">Authentication</h2>
-  <div class="code">x-payment-response: &lt;signed-payment-object&gt;
-x-payment-amount: 0.05
-x-payment-currency: USDC
-x-facilitator: facilitator.openx402.ai</div>
+  <p style="color:#9ca3af;line-height:1.7;margin-bottom:1rem">DataXchange uses the <a href="https://x402.org" style="color:#6366f1">x402 payment protocol</a>. Requests to paid endpoints return <code style="color:#a78bfa">402 Payment Required</code> with an <code style="color:#a78bfa">accepts</code> array. Use any x402-compatible client (<code style="color:#a78bfa">x402-fetch</code>, <code style="color:#a78bfa">x402-axios</code>, or Conway Terminal's <code style="color:#a78bfa">x402_fetch</code>) to handle payment automatically.</p>
+  <h2 id="auth">Authentication (x402 Protocol)</h2>
+  <p style="color:#9ca3af;line-height:1.7;margin-bottom:1rem">All paid endpoints follow the x402 flow: request → 402 with payment requirements → client signs USDC payment → facilitator verifies → service delivered.</p>
+  <div class="code">// Using x402-fetch:
+import {{ x402Fetch }} from 'x402-fetch';
+const resp = await x402Fetch('{resource_base}/v1/data/markets', {{
+  paymentWallet: wallet
+}});</div>
   <h2 id="markets">Market Data</h2>
   <div class="endpoint">
     <div class="ep-head"><span class="method">GET</span><span class="path">/v1/data/markets</span></div>
     <div class="ep-body">
-      <p>Real-time order book depth, recent trades, and 24h statistics across 500+ pairs. Payment: 0.05 USDC per call.</p>
-      <div class="code">curl https://api.dataxchange.io/v1/data/markets \
-  -H "x-payment-response: $PAYMENT_PROOF" \
-  -H "x-payment-amount: 0.05"</div>
+      <p>Real-time order book depth, recent trades, and 24h statistics across 500+ pairs. Payment: 0.05 USDC per call via x402.</p>
     </div>
   </div>
   <h2 id="analytics">Analytics</h2>
   <div class="endpoint">
     <div class="ep-head"><span class="method">GET</span><span class="path">/v1/data/analytics</span></div>
     <div class="ep-body">
-      <p>On-chain flow analysis and wallet behavioral clustering. Payment: 0.10 USDC per request.</p>
-      <div class="code">curl https://api.dataxchange.io/v1/data/analytics \
-  -H "x-payment-response: $PAYMENT_PROOF" \
-  -H "x-payment-amount: 0.10"</div>
+      <p>On-chain flow analysis and wallet behavioral clustering. Payment: 0.10 USDC per request via x402.</p>
     </div>
   </div>
   <h2 id="prices">Price Feeds</h2>
   <div class="endpoint">
     <div class="ep-head"><span class="method">GET</span><span class="path">/v1/data/prices</span></div>
     <div class="ep-body">
-      <p>Sub-second price feeds with cryptographic attestations for DeFi protocols. Payment: 0.02 USDC per request.</p>
-      <div class="code">curl https://api.dataxchange.io/v1/data/prices \
-  -H "x-payment-response: $PAYMENT_PROOF" \
-  -H "x-payment-amount: 0.02"</div>
+      <p>Sub-second price feeds with cryptographic attestations for DeFi protocols. Payment: 0.02 USDC per request via x402.</p>
     </div>
   </div>
 </main>
@@ -430,8 +604,9 @@ async fn health_endpoint() -> impl IntoResponse {
         Json(serde_json::json!({
             "status": "ok",
             "version": "2.1.0",
-            "network": "eip155:8453",
-            "protocol": "x402"
+            "network": BASE_NETWORK,
+            "protocol": "x402",
+            "facilitator": "openx402.ai"
         })),
     )
 }
@@ -450,85 +625,29 @@ async fn hits_endpoint(State(state): State<Arc<HoneypotState>>) -> impl IntoResp
 async fn fake_markets_endpoint(
     State(state): State<Arc<HoneypotState>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let headers_map = extract_headers_map(&headers);
-    let source_ip = extract_ip(&headers);
-    let hit = build_hit(source_ip.clone(), "/v1/data/markets", &headers, headers_map);
-    state.record_hit(&hit);
-    state.maybe_alert(&hit);
-
-    (
-        StatusCode::PAYMENT_REQUIRED,
-        [
-            ("x-payment-required", "true"),
-            ("x-payment-amount", "0.05"),
-            ("x-payment-currency", "USDC"),
-            ("x-facilitator", "facilitator.openx402.ai"),
-        ],
-        Json(serde_json::json!({
-            "error": "payment_required",
-            "amount": "0.05",
-            "currency": "USDC",
-            "network": "eip155:8453"
-        })),
-    )
+) -> axum::response::Response {
+    handle_x402_endpoint(&state, headers, "/v1/data/markets", |pg| {
+        pg.poison_market_data()
+    })
+    .await
 }
 
 async fn fake_analytics_endpoint(
     State(state): State<Arc<HoneypotState>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let headers_map = extract_headers_map(&headers);
-    let source_ip = extract_ip(&headers);
-    let hit = build_hit(
-        source_ip.clone(),
-        "/v1/data/analytics",
-        &headers,
-        headers_map,
-    );
-    state.record_hit(&hit);
-    state.maybe_alert(&hit);
-
-    (
-        StatusCode::PAYMENT_REQUIRED,
-        [
-            ("x-payment-required", "true"),
-            ("x-payment-amount", "0.10"),
-            ("x-payment-currency", "USDC"),
-            ("x-facilitator", "facilitator.openx402.ai"),
-        ],
-        Json(serde_json::json!({
-            "error": "payment_required",
-            "amount": "0.10",
-            "currency": "USDC",
-            "network": "eip155:8453"
-        })),
-    )
+) -> axum::response::Response {
+    handle_x402_endpoint(&state, headers, "/v1/data/analytics", |pg| {
+        pg.poison_analytics_data()
+    })
+    .await
 }
 
 async fn fake_prices_endpoint(
     State(state): State<Arc<HoneypotState>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let headers_map = extract_headers_map(&headers);
-    let source_ip = extract_ip(&headers);
-    let hit = build_hit(source_ip.clone(), "/v1/data/prices", &headers, headers_map);
-    state.record_hit(&hit);
-    state.maybe_alert(&hit);
-
-    (
-        StatusCode::PAYMENT_REQUIRED,
-        [
-            ("x-payment-required", "true"),
-            ("x-payment-amount", "0.02"),
-            ("x-payment-currency", "USDC"),
-            ("x-facilitator", "facilitator.openx402.ai"),
-        ],
-        Json(serde_json::json!({
-            "error": "payment_required",
-            "amount": "0.02",
-            "currency": "USDC",
-            "network": "eip155:8453"
-        })),
-    )
+) -> axum::response::Response {
+    handle_x402_endpoint(&state, headers, "/v1/data/prices", |pg| {
+        pg.poison_price_feed()
+    })
+    .await
 }
