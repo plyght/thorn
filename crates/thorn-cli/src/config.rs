@@ -120,6 +120,8 @@ pub struct ScannerConfig {
     pub rpc_url: String,
     #[serde(default = "default_scanner_poll_interval_ms")]
     pub poll_interval_ms: u64,
+    #[serde(default)]
+    pub seed_wallets: Vec<String>,
 }
 
 fn default_honeypot_port() -> u16 {

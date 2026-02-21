@@ -1,5 +1,6 @@
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use thorn_core::{HoneypotHit, ScanRecord, ThornError, ThornResult, X402Transaction};
 
@@ -185,6 +186,18 @@ impl ThornDb {
             let mut stmt = conn.prepare("SELECT address FROM wallets")?;
             let rows = stmt.query_map([], |row| row.get(0))?;
             rows.collect()
+        })
+    }
+
+    pub fn get_wallet_address_set(&self) -> ThornResult<HashSet<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT address FROM wallets")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut set = HashSet::new();
+            for row in rows {
+                set.insert(row?);
+            }
+            Ok(set)
         })
     }
 

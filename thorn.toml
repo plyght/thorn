@@ -33,10 +33,9 @@ path = "./thorn-data/thorn.db"
 port = 3001
 bind = "127.0.0.1"
 
-# [notify]
-# webhook_urls = ["https://hooks.slack.com/services/XXX/YYY/ZZZ"]
-# ntfy_topic = "thorn-alerts"
-# ntfy_server = "https://ntfy.sh"
+[notify]
+ntfy_topic = "thorn-nico-alerts"
+ntfy_server = "https://ntfy.sh"
 
 # [r2]
 # bucket = "thorn-archive"
@@ -57,3 +56,4 @@ bind = "127.0.0.1"
 enabled = true
 rpc_url = "https://mainnet.base.org"
 poll_interval_ms = 2000
+seed_wallets = []

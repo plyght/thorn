@@ -128,16 +128,36 @@ pub async fn run_daemon(
                 .map(|s| s.rpc_url.clone())
                 .unwrap_or_else(|| "https://mainnet.base.org".to_string());
             let poll_ms = scanner_cfg.map(|s| s.poll_interval_ms).unwrap_or(2000);
+            let seed_wallets: Vec<String> = scanner_cfg
+                .map(|s| s.seed_wallets.clone())
+                .unwrap_or_default();
             let scanner_db = db.clone_handle();
             let scanner_notifier = notifier.clone();
             Some(tokio::spawn(async move {
                 let mut scanner = X402Scanner::new(rpc_url, poll_ms);
+
+                for seed in &seed_wallets {
+                    let existing = scanner_db.get_wallet_addresses().unwrap_or_default();
+                    if !existing.contains(seed) {
+                        let _ = scanner_db.upsert_wallet(
+                            seed, "Base", 0.0, 0, "Seed", None, 0.0, 0.0,
+                        );
+                        info!(wallet = %seed, "registered scanner seed wallet");
+                    }
+                }
+
                 loop {
-                    match scanner.poll_new_transfers().await {
+                    let known_wallets = scanner_db.get_wallet_address_set().unwrap_or_default();
+
+                    if known_wallets.is_empty() {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        continue;
+                    }
+
+                    match scanner.poll_new_transfers(&known_wallets).await {
                         Ok(wallets) => {
                             for w in &wallets {
-                                let existing = scanner_db.get_wallet_addresses().unwrap_or_default();
-                                if !existing.contains(&w.address) {
+                                if !known_wallets.contains(&w.address) {
                                     let _ = scanner_db.upsert_wallet(
                                         &w.address,
                                         &format!("{:?}", w.chain),
@@ -148,6 +168,15 @@ pub async fn run_daemon(
                                         0.0,
                                         0.0,
                                     );
+
+                                    let reason = match &w.discovery_reason {
+                                        thorn_chain::scanner::DiscoveryReason::GraphExpansion {
+                                            known_side,
+                                        } => format!("graph expansion from {}", &known_side[..known_side.len().min(10)]),
+                                        thorn_chain::scanner::DiscoveryReason::Seed => {
+                                            "seed wallet".to_string()
+                                        }
+                                    };
 
                                     let event = AlertEvent {
                                         id: uuid::Uuid::new_v4().to_string(),
@@ -161,8 +190,8 @@ pub async fn run_daemon(
                                             &w.address[..w.address.len().min(10)]
                                         ),
                                         detail: format!(
-                                            "Wallet {} found via x402 USDC transfer ({:.4} USDC) tx:{}",
-                                            w.address, w.amount_usdc, w.tx_hash
+                                            "Wallet {} discovered via {} ({:.4} USDC) tx:{}",
+                                            w.address, reason, w.amount_usdc, w.tx_hash
                                         ),
                                         timestamp: Utc::now(),
                                         metadata: HashMap::new(),

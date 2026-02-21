@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use thorn_core::{Chain, ThornError, ThornResult};
-use tracing::info;
+use tracing::{debug, info};
 
 const BASE_USDC: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const TRANSFER_TOPIC: &str =
@@ -20,6 +21,12 @@ pub struct DiscoveredWallet {
     pub amount_usdc: f64,
     pub counterparty: String,
     pub block_number: u64,
+    pub discovery_reason: DiscoveryReason,
+}
+
+pub enum DiscoveryReason {
+    GraphExpansion { known_side: String },
+    Seed,
 }
 
 impl X402Scanner {
@@ -62,7 +69,10 @@ impl X402Scanner {
             .map_err(|e| ThornError::Chain(e.to_string()))
     }
 
-    pub async fn poll_new_transfers(&mut self) -> ThornResult<Vec<DiscoveredWallet>> {
+    pub async fn poll_new_transfers(
+        &mut self,
+        known_wallets: &HashSet<String>,
+    ) -> ThornResult<Vec<DiscoveredWallet>> {
         let current_block = self.get_block_number().await?;
 
         if self.last_block == 0 {
@@ -70,6 +80,7 @@ impl X402Scanner {
             info!(
                 from_block = self.last_block,
                 current = current_block,
+                known = known_wallets.len(),
                 "x402 scanner initialized, starting from recent blocks"
             );
         }
@@ -101,6 +112,7 @@ impl X402Scanner {
         })?;
 
         let mut wallets = Vec::new();
+        let mut skipped = 0u64;
 
         for log in logs_arr {
             let topics = match log["topics"].as_array() {
@@ -123,6 +135,14 @@ impl X402Scanner {
             let from_addr = extract_address(from_topic);
             let to_addr = extract_address(to_topic);
 
+            let from_known = known_wallets.contains(&from_addr);
+            let to_known = known_wallets.contains(&to_addr);
+
+            if !from_known && !to_known {
+                skipped += 1;
+                continue;
+            }
+
             let tx_hash = log["transactionHash"]
                 .as_str()
                 .unwrap_or_default()
@@ -131,32 +151,51 @@ impl X402Scanner {
             let block_number =
                 u64::from_str_radix(block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
-            wallets.push(DiscoveredWallet {
-                address: from_addr.clone(),
-                chain: Chain::Base,
-                tx_hash: tx_hash.clone(),
-                amount_usdc,
-                counterparty: to_addr.clone(),
-                block_number,
-            });
-
-            wallets.push(DiscoveredWallet {
-                address: to_addr,
-                chain: Chain::Base,
-                tx_hash,
-                amount_usdc,
-                counterparty: from_addr,
-                block_number,
-            });
+            if from_known && !to_known {
+                wallets.push(DiscoveredWallet {
+                    address: to_addr,
+                    chain: Chain::Base,
+                    tx_hash,
+                    amount_usdc,
+                    counterparty: from_addr.clone(),
+                    block_number,
+                    discovery_reason: DiscoveryReason::GraphExpansion {
+                        known_side: from_addr,
+                    },
+                });
+            } else if to_known && !from_known {
+                wallets.push(DiscoveredWallet {
+                    address: from_addr,
+                    chain: Chain::Base,
+                    tx_hash,
+                    amount_usdc,
+                    counterparty: to_addr.clone(),
+                    block_number,
+                    discovery_reason: DiscoveryReason::GraphExpansion {
+                        known_side: to_addr,
+                    },
+                });
+            }
         }
 
         self.last_block = to_block;
 
+        if !wallets.is_empty() || skipped > 0 {
+            debug!(
+                blocks = format!("{}..{}", from_block, to_block),
+                total_transfers = logs_arr.len(),
+                skipped = skipped,
+                promoted = wallets.len(),
+                known_wallets = known_wallets.len(),
+                "x402 scanner poll"
+            );
+        }
+
         if !wallets.is_empty() {
             info!(
                 blocks = format!("{}..{}", from_block, to_block),
-                transfers = wallets.len() / 2,
-                "x402 scanner found USDC transfers"
+                promoted = wallets.len(),
+                "x402 scanner found graph-connected transfers"
             );
         }
 
